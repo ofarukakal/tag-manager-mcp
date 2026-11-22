@@ -16,14 +16,12 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from .access import AccessMode, get_access_mode, scopes_for_mode
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
-SCOPES = (
-    "https://www.googleapis.com/auth/tagmanager.edit.containers",
-    "https://www.googleapis.com/auth/tagmanager.manage.accounts",
-    "https://www.googleapis.com/auth/tagmanager.publish",
-)
+SCOPES = scopes_for_mode(AccessMode.READ)
 
 
 class AuthenticationError(RuntimeError):
@@ -46,13 +44,15 @@ class CredentialProvider:
             raise AuthenticationError(
                 "GTM_AUTH_MODE must be one of: auto, user, service-account, adc"
             )
+        self.access_mode = get_access_mode(self.env)
+        self.scopes = scopes_for_mode(self.access_mode)
 
     @property
     def token_file(self) -> Path:
         configured = self.env.get("GTM_OAUTH_TOKEN_FILE")
         if configured:
             return Path(configured).expanduser()
-        return Path.home() / ".config/gtm-mcp/token.json"
+        return Path.home() / f".config/gtm-mcp/token-{self.access_mode.value}.json"
 
     @property
     def client_secrets_file(self) -> Path | None:
@@ -80,7 +80,7 @@ class CredentialProvider:
 
         if self.mode == "adc":
             try:
-                credentials, _ = default_credentials(scopes=SCOPES)
+                credentials, _ = default_credentials(scopes=self.scopes)
                 return AuthResult(credentials, "application-default-credentials")
             except Exception as exc:
                 errors.append(f"application default credentials: {exc}")
@@ -91,25 +91,66 @@ class CredentialProvider:
         )
         raise AuthenticationError("; ".join(errors) + f". {hint}")
 
+    def _scopes_match(self, credentials: UserCredentials) -> bool:
+        expected = set(self.scopes)
+        if set(credentials.scopes or ()) != expected:
+            return False
+        granted = getattr(credentials, "granted_scopes", None)
+        return granted is None or set(granted) == expected
+
+    def _scope_mismatch_error(
+        self, source: str, credentials: UserCredentials
+    ) -> AuthenticationError:
+        expected = set(self.scopes)
+        granted_attr = getattr(credentials, "granted_scopes", None)
+        if granted_attr is not None and set(granted_attr) != expected:
+            granted = set(granted_attr)
+        else:
+            granted = set(credentials.scopes or ())
+        details: list[str] = []
+        missing = [scope for scope in self.scopes if scope not in granted]
+        extra = sorted(granted - expected)
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected: {', '.join(extra)}")
+        detail_text = f" ({'; '.join(details)})" if details else ""
+        return AuthenticationError(
+            f"{source} was granted for different scopes than required for "
+            f"{self.access_mode.value!r} mode{detail_text}; "
+            f"re-run `tag-manager-auth` with GTM_ACCESS_MODE={self.access_mode.value}"
+        )
+
     def _user_credentials(self, *, interactive: bool) -> UserCredentials:
         credentials: UserCredentials | None = None
         if self.token_file.exists():
             try:
-                credentials = UserCredentials.from_authorized_user_file(
-                    str(self.token_file), scopes=SCOPES
-                )
+                # Load without overriding scopes so we verify the token's actual granted scopes.
+                credentials = UserCredentials.from_authorized_user_file(str(self.token_file))
             except Exception:
                 if not interactive:
                     raise
 
+        if credentials is not None and not self._scopes_match(credentials):
+            if not interactive:
+                raise self._scope_mismatch_error("cached user token", credentials)
+            credentials = None
+
         if credentials and credentials.expired and credentials.refresh_token:
             try:
                 credentials.refresh(Request())
-                self._save_user_credentials(credentials)
             except Exception:
                 if not interactive:
                     raise
                 credentials = None
+
+            if credentials is not None:
+                if not self._scopes_match(credentials):
+                    if not interactive:
+                        raise self._scope_mismatch_error("refreshed user token", credentials)
+                    credentials = None
+                else:
+                    self._save_user_credentials(credentials)
 
         if credentials and credentials.valid:
             return credentials
@@ -123,7 +164,7 @@ class CredentialProvider:
         if not secrets.is_file():
             raise AuthenticationError(f"OAuth client secrets file not found: {secrets}")
 
-        flow = InstalledAppFlow.from_client_secrets_file(str(secrets), scopes=SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(str(secrets), scopes=self.scopes)
         credentials = flow.run_local_server(
             host="127.0.0.1",
             port=0,
@@ -131,6 +172,8 @@ class CredentialProvider:
             prompt="consent",
             open_browser=True,
         )
+        if not self._scopes_match(credentials):
+            raise self._scope_mismatch_error("granted OAuth token", credentials)
         self._save_user_credentials(credentials)
         return credentials
 
@@ -147,10 +190,12 @@ class CredentialProvider:
 
         if raw_json:
             info = json.loads(raw_json)
-            return ServiceAccountCredentials.from_service_account_info(info, scopes=SCOPES)
+            return ServiceAccountCredentials.from_service_account_info(info, scopes=self.scopes)
         if filename:
             path = Path(filename).expanduser()
             if not path.is_file():
                 raise AuthenticationError(f"service-account file not found: {path}")
-            return ServiceAccountCredentials.from_service_account_file(str(path), scopes=SCOPES)
+            return ServiceAccountCredentials.from_service_account_file(
+                str(path), scopes=self.scopes
+            )
         raise AuthenticationError("no service-account credentials configured")

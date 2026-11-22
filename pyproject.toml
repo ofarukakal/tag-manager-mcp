@@ -23,6 +23,7 @@ dev = ["pytest>=8.3.0", "pytest-cov>=6.0.0", "ruff>=0.9.0"]
 [project.scripts]
 tag-manager-mcp = "tag_manager_mcp.server:main"
 tag-manager-auth = "tag_manager_mcp.auth_cli:main"
+tag-manager-export = "tag_manager_mcp.export_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tag_manager_mcp"]
