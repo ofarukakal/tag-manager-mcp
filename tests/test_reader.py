@@ -70,7 +70,20 @@ def _make_client(tmp_path: Any, service: Any) -> GTMClient:
 
 
 def test_export_container_live_and_specific_version(tmp_path: Any) -> None:
-    live_payload = {"containerVersionId": "5", "name": "Live v5", "tag": []}
+    live_payload = {
+        "containerVersionId": "5",
+        "name": "Live v5",
+        "container": {"publicId": "GTM-TEST", "usageContext": ["web"]},
+        "tag": [
+            {
+                "name": "GA4",
+                "type": "gaawe",
+                "tagFiringOption": "oncePerEvent",
+                "parameter": [{"type": "template", "key": "eventName", "value": "view"}],
+            }
+        ],
+        "trigger": [{"name": "PV", "type": "pageview"}],
+    }
     v3_payload = {"containerVersionId": "3", "name": "Old v3", "tag": [{"name": "T1"}]}
     versions_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -97,17 +110,28 @@ def test_export_container_live_and_specific_version(tmp_path: Any) -> None:
 
     reader = GTMReader(_make_client(tmp_path, Service()))
 
+    raw_live = reader.live_version("100", "200")
+    assert raw_live["container"]["usageContext"] == ["web"]
+    assert raw_live["tag"][0]["tagFiringOption"] == "oncePerEvent"
+    assert raw_live["tag"][0]["parameter"][0]["type"] == "template"
+    assert raw_live["trigger"][0]["type"] == "pageview"
+
     exported_live = reader.export_container("100", "200")
     assert set(exported_live.keys()) == {"exportFormatVersion", "exportTime", "containerVersion"}
     assert exported_live["exportFormatVersion"] == 2
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", exported_live["exportTime"])
-    assert exported_live["containerVersion"] == live_payload
+    assert exported_live["containerVersion"]["container"]["usageContext"] == ["WEB"]
+    assert exported_live["containerVersion"]["tag"][0]["type"] == "gaawe"
+    assert exported_live["containerVersion"]["tag"][0]["tagFiringOption"] == "ONCE_PER_EVENT"
+    assert exported_live["containerVersion"]["tag"][0]["parameter"][0]["type"] == "TEMPLATE"
+    assert exported_live["containerVersion"]["trigger"][0]["type"] == "PAGEVIEW"
 
     exported_v3 = reader.export_container("100", "200", version_id="3")
     assert set(exported_v3.keys()) == {"exportFormatVersion", "exportTime", "containerVersion"}
     assert exported_v3["exportFormatVersion"] == 2
     assert exported_v3["containerVersion"] == v3_payload
     assert versions_calls == [
+        ("live", {"parent": "accounts/100/containers/200"}),
         ("live", {"parent": "accounts/100/containers/200"}),
         ("get", {"path": "accounts/100/containers/200/versions/3"}),
     ]
@@ -338,6 +362,92 @@ def test_fetch_all_live_filters_usage_context_and_records_missing_live(tmp_path:
 
     live_all = reader.fetch_all_live(usage_context=None)
     assert [item["containerId"] for item in live_all] == ["101", "102", "103"]
+
+
+def test_fetch_live_for_resolves_directly_and_continues_past_errors(tmp_path: Any) -> None:
+    not_found = HttpError(Response({"status": "404"}), b'{"error":{"message":"Not found"}}')
+    lookup_calls: list[dict[str, Any]] = []
+    live_calls: list[str] = []
+
+    class Versions:
+        def live(self, parent: str) -> FakeRequest:
+            live_calls.append(parent)
+            if parent == "accounts/1/containers/101":
+                return FakeRequest({"containerVersionId": "7", "name": "Live 7"})
+            return FakeRequest(not_found)
+
+    class Containers:
+        def lookup(self, **kwargs: Any) -> FakeRequest:
+            lookup_calls.append(kwargs)
+            tag_id = kwargs.get("tagId")
+            if tag_id == "GTM-OK":
+                return FakeRequest(
+                    {
+                        "accountId": "1",
+                        "containerId": "101",
+                        "publicId": "GTM-OK",
+                        "name": "Site OK",
+                    }
+                )
+            if tag_id == "GTM-UNPUB":
+                return FakeRequest(
+                    {
+                        "accountId": "1",
+                        "containerId": "102",
+                        "publicId": "GTM-UNPUB",
+                        "name": "Unpublished",
+                    }
+                )
+            return FakeRequest(not_found)
+
+        def list(self, **kwargs: Any) -> FakeRequest:
+            raise AssertionError("containers.list must not be called by fetch_live_for")
+
+        def versions(self) -> Versions:
+            return Versions()
+
+    class Accounts:
+        def list(self, **kwargs: Any) -> FakeRequest:
+            raise AssertionError("accounts.list must not be called by fetch_live_for")
+
+        def containers(self) -> Containers:
+            return Containers()
+
+    class Service:
+        def accounts(self) -> Accounts:
+            return Accounts()
+
+    reader = GTMReader(_make_client(tmp_path, Service()))
+    results = reader.fetch_live_for(["GTM-MISSING", "gtm-ok", "GTM-UNPUB"])
+
+    assert lookup_calls == [
+        {"tagId": "GTM-MISSING"},
+        {"tagId": "GTM-OK"},
+        {"tagId": "GTM-UNPUB"},
+    ]
+    assert live_calls == [
+        "accounts/1/containers/101",
+        "accounts/1/containers/102",
+    ]
+    assert len(results) == 3
+    assert results[0]["publicId"] == "GTM-MISSING"
+    assert results[0]["accountId"] == ""
+    assert results[0]["containerId"] == ""
+    assert results[0]["version"] is None
+    assert results[0]["error"] is not None
+    assert results[1] == {
+        "accountId": "1",
+        "containerId": "101",
+        "publicId": "GTM-OK",
+        "name": "Site OK",
+        "version": {"containerVersionId": "7", "name": "Live 7"},
+        "error": None,
+    }
+    assert results[2]["publicId"] == "GTM-UNPUB"
+    assert results[2]["accountId"] == "1"
+    assert results[2]["containerId"] == "102"
+    assert results[2]["version"] is None
+    assert results[2]["error"] is not None
 
 
 def test_summarize_version_counts_and_paused_tags() -> None:

@@ -128,8 +128,8 @@ write scopes) and uses the shared quota guardrails.
 Options:
 
 - `--out DIR`: Output directory (defaults to `GTM_EXPORT_DIR` or `~/.local/share/gtm-mcp/exports`).
-- `--usage-context CONTEXT`: Container usage context filter (default `web`; pass `all` for no filter).
-- `--container PUBLIC_ID`: Repeatable filter to export only specific public container IDs.
+- `--usage-context CONTEXT`: Container usage context filter (default `web`; pass `all` for no filter; ignored when `--container` is given).
+- `--container PUBLIC_ID`: Repeatable public container ID to resolve and export directly without scanning all accounts.
 
 Exit codes: `0` when at least one container was exported and none failed, `1` when any container
 failed, fetching failed, or none matched, `2` on authentication or configuration error

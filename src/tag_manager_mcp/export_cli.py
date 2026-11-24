@@ -28,14 +28,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--usage-context",
         default="web",
-        help="Container usageContext filter (default: web; use 'all' for no filter).",
+        help=(
+            "Container usageContext filter (default: web; use 'all' for no filter; "
+            "ignored when --container is given)."
+        ),
     )
     parser.add_argument(
         "--container",
         action="append",
         default=None,
         metavar="PUBLIC_ID",
-        help="Export only the given container public ID (repeatable).",
+        help="Export only the given container public ID via direct lookup (repeatable).",
     )
     return parser
 
@@ -50,14 +53,18 @@ def main(argv: Sequence[str] | None = None, reader: GTMReader | None = None) -> 
     """Run the bulk GTM live-container export CLI and return an exit status code."""
     args = _build_parser().parse_args(list(argv) if argv is not None else None)
     usage_context = None if args.usage_context == "all" else args.usage_context
-    container_filter = (
-        {cid.strip().upper() for cid in args.container} if args.container else None
+    containers = (
+        [cid.strip().upper() for cid in args.container] if args.container else None
     )
 
     try:
         get_access_mode()
         active_reader = reader if reader is not None else _build_readonly_reader()
-        items = active_reader.fetch_all_live(usage_context=usage_context)
+        items = (
+            active_reader.fetch_live_for(containers)
+            if containers is not None
+            else active_reader.fetch_all_live(usage_context=usage_context)
+        )
     except AccessModeError as exc:
         msg = " ".join(str(exc).splitlines())
         print(f"Configuration error: {msg}", file=sys.stderr)
@@ -69,13 +76,6 @@ def main(argv: Sequence[str] | None = None, reader: GTMReader | None = None) -> 
         msg = " ".join(str(exc).splitlines())
         print(f"ERROR  {msg}", file=sys.stderr)
         return 1
-
-    if container_filter is not None:
-        items = [
-            item
-            for item in items
-            if str(item.get("publicId", "")).strip().upper() in container_filter
-        ]
 
     exported = 0
     failed = 0

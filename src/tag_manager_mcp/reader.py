@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from .auth import AuthenticationError
 from .client import GTMClient, _id, account_path, container_path, workspace_path
+from .export_format import to_ui_export
 
 WORKSPACE_ENTITY_SPECS: dict[str, tuple[str, bool]] = {
     "tags": ("tag", True),
@@ -77,7 +79,7 @@ class GTMReader:
         return {
             "exportFormatVersion": 2,
             "exportTime": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "containerVersion": version,
+            "containerVersion": to_ui_export(version),
         }
 
     def list_workspace_entities(
@@ -188,6 +190,40 @@ class GTMReader:
                         "error": error,
                     }
                 )
+        return results
+
+    def fetch_live_for(self, public_ids: list[str]) -> list[dict[str, Any]]:
+        """Resolve each public container ID directly and fetch only its live version."""
+        results: list[dict[str, Any]] = []
+        for raw_id in public_ids:
+            identifier = str(raw_id).strip().upper()
+            account_id = ""
+            container_id = ""
+            public_id = identifier
+            name = ""
+            version: dict[str, Any] | None = None
+            error: str | None = None
+            try:
+                container = self.client.resolve_container_identifier(identifier)
+                account_id = str(container.get("accountId", ""))
+                container_id = str(container.get("containerId", ""))
+                public_id = str(container.get("publicId") or identifier)
+                name = str(container.get("name", ""))
+                version = self.live_version(account_id, container_id)
+            except AuthenticationError:
+                raise
+            except Exception as exc:
+                error = str(exc)
+            results.append(
+                {
+                    "accountId": account_id,
+                    "containerId": container_id,
+                    "publicId": public_id,
+                    "name": name,
+                    "version": version,
+                    "error": error,
+                }
+            )
         return results
 
 
