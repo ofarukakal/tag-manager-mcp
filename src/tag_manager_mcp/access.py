@@ -16,6 +16,9 @@ SCOPE_EDIT_CONTAINERVERSIONS = (
     "https://www.googleapis.com/auth/tagmanager.edit.containerversions"
 )
 SCOPE_PUBLISH = "https://www.googleapis.com/auth/tagmanager.publish"
+SCOPE_DELETE_CONTAINERS = "https://www.googleapis.com/auth/tagmanager.delete.containers"
+SCOPE_MANAGE_ACCOUNTS = "https://www.googleapis.com/auth/tagmanager.manage.accounts"
+SCOPE_MANAGE_USERS = "https://www.googleapis.com/auth/tagmanager.manage.users"
 
 
 class AccessMode(str, Enum):
@@ -24,6 +27,7 @@ class AccessMode(str, Enum):
     READ = "read"
     WRITE = "write"
     PUBLISH = "publish"
+    ADMIN = "admin"
 
     def __str__(self) -> str:
         return self.value
@@ -42,12 +46,22 @@ SCOPES_BY_MODE: dict[AccessMode, tuple[str, ...]] = {
         SCOPE_EDIT_CONTAINERVERSIONS,
         SCOPE_PUBLISH,
     ),
+    AccessMode.ADMIN: (
+        SCOPE_READONLY,
+        SCOPE_EDIT_CONTAINERS,
+        SCOPE_EDIT_CONTAINERVERSIONS,
+        SCOPE_PUBLISH,
+        SCOPE_DELETE_CONTAINERS,
+        SCOPE_MANAGE_ACCOUNTS,
+        SCOPE_MANAGE_USERS,
+    ),
 }
 
 _MODE_RANK: dict[AccessMode, int] = {
     AccessMode.READ: 0,
     AccessMode.WRITE: 1,
     AccessMode.PUBLISH: 2,
+    AccessMode.ADMIN: 3,
 }
 
 F = TypeVar("F", bound=Callable[..., Any])

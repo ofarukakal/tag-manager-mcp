@@ -354,6 +354,14 @@ def test_new_tools_registered_in_read_mode_and_write_publish_unchanged() -> None
         "list_destinations",
         "inventory",
         "list_live_versions",
+        "latest_version_header",
+        "list_folder_entities",
+        "get_workspace",
+        "get_environment",
+        "get_destination",
+        "get_container_snippet",
+        "get_account",
+        "plan_container_import",
     }
     expected_write = {
         "create_workspace",
@@ -361,20 +369,59 @@ def test_new_tools_registered_in_read_mode_and_write_publish_unchanged() -> None
         "create_entity",
         "update_entity",
         "delete_entity",
+        "revert_entity",
         "enable_builtin_variables",
         "disable_builtin_variables",
+        "revert_builtin_variable",
+        "import_template_from_gallery",
+        "move_entities_to_folder",
+        "update_workspace",
+        "resolve_conflict",
+        "quick_preview",
+        "bulk_update",
         "create_version",
+        "update_version",
+        "delete_version",
+        "undelete_version",
+        "create_environment",
+        "update_environment",
+        "delete_environment",
+        "link_destination",
+        "apply_container_import",
     }
-    expected_publish = {"publish_version"}
+    expected_publish = {
+        "reauthorize_environment",
+        "prepare_publish",
+        "publish_version",
+        "list_publish_requests",
+        "set_latest_version",
+        "publish_to_environment",
+    }
+    expected_admin = {
+        "delete_workspace",
+        "create_container",
+        "update_container",
+        "delete_container",
+        "combine_containers",
+        "move_tag_id",
+        "update_account",
+        "list_user_permissions",
+        "get_user_permission",
+        "create_user_permission",
+        "update_user_permission",
+        "delete_user_permission",
+    }
 
     read_srv = server.build_server(AccessMode.READ)
     read_names = {t.name for t in asyncio.run(read_srv.list_tools())}
     assert new_read_tools.issubset(read_names)
     assert read_names.isdisjoint(expected_write)
     assert read_names.isdisjoint(expected_publish)
+    assert read_names.isdisjoint(expected_admin)
 
     by_level = {spec.name: spec.level for spec in server.tool_registry.all_tools}
     assert {name for name, lvl in by_level.items() if lvl is AccessMode.WRITE} == expected_write
     assert {
         name for name, lvl in by_level.items() if lvl is AccessMode.PUBLISH
     } == expected_publish
+    assert {name for name, lvl in by_level.items() if lvl is AccessMode.ADMIN} == expected_admin

@@ -351,7 +351,7 @@ class GTMClient:
         workspace_id: str,
         variable_types: list[str],
     ) -> dict[str, Any]:
-        path = workspace_path(account_id, container_id, workspace_id)
+        path = f"{workspace_path(account_id, container_id, workspace_id)}/built_in_variables"
         resource = self.service.accounts().containers().workspaces().built_in_variables()
         return self._execute(lambda: resource.delete(path=path, type=variable_types))
 

@@ -6,6 +6,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -29,6 +30,8 @@ call_id_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 SENSITIVE_KEYS = {
     "access_token",
     "authorization",
+    "authorization_code",
+    "authorizationcode",
     "client_secret",
     "credentials",
     "id_token",
@@ -37,6 +40,40 @@ SENSITIVE_KEYS = {
     "refresh_token",
     "service_account_json",
 }
+
+_SENSITIVE_KEY_ALT = "|".join(
+    re.escape(key) for key in sorted(SENSITIVE_KEYS, key=len, reverse=True)
+)
+_SENSITIVE_TEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Escaped double quotes, e.g. \"authorizationCode\": \"SECRET\"
+    re.compile(
+        rf'(\\"(?:{_SENSITIVE_KEY_ALT})\\"\s*:\s*\\")'
+        r'(?:[^"\\]|\\\\\\"|\\\\|\\[^"])*'
+        r'(\\")',
+        re.IGNORECASE,
+    ),
+    # Double quotes, e.g. "authorizationCode": "SECRET"
+    re.compile(
+        rf'((?<!\\)"(?:{_SENSITIVE_KEY_ALT})"\s*:\s*")'
+        r'(?:[^"\\]|\\.)*'
+        r'(")',
+        re.IGNORECASE,
+    ),
+    # Escaped single quotes, e.g. \'refresh_token\': \'SECRET\'
+    re.compile(
+        rf"(\\'(?:{_SENSITIVE_KEY_ALT})\\'\s*:\s*\\')"
+        r"(?:[^'\\]|\\\\\\'|\\\\|\\[^'])*"
+        r"(\\')",
+        re.IGNORECASE,
+    ),
+    # Single quotes, e.g. 'refresh_token': 'SECRET'
+    re.compile(
+        rf"((?<!\\)'(?:{_SENSITIVE_KEY_ALT})'\s*:\s*')"
+        r"(?:[^'\\]|\\.)*"
+        r"(')",
+        re.IGNORECASE,
+    ),
+)
 
 
 class DebugCallLogger:
@@ -110,7 +147,9 @@ class DebugCallLogger:
                         request_json,
                         response_json,
                         type(error).__name__ if error else None,
-                        _truncate(str(error), self.max_payload_bytes) if error else None,
+                        _truncate(_sanitize_text(str(error)), self.max_payload_bytes)
+                        if error
+                        else None,
                         os.getpid(),
                     ),
                 )
@@ -204,7 +243,7 @@ class DebugCallLogger:
         if value is None:
             return None
         safe = sanitize(value)
-        serialized = json.dumps(safe, ensure_ascii=False, default=str)
+        serialized = _sanitize_text(json.dumps(safe, ensure_ascii=False, default=str))
         return _truncate(serialized, self.max_payload_bytes)
 
 
@@ -221,6 +260,13 @@ def get_debug_logger() -> DebugCallLogger:
     return _logger
 
 
+def _sanitize_text(text: str) -> str:
+    result = text
+    for pattern in _SENSITIVE_TEXT_PATTERNS:
+        result = pattern.sub(r"\1[REDACTED]\2", result)
+    return result
+
+
 def sanitize(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -229,6 +275,8 @@ def sanitize(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [sanitize(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_text(value)
     if isinstance(value, bytes):
         try:
             return sanitize(json.loads(value.decode("utf-8")))

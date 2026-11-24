@@ -9,8 +9,11 @@ import pytest
 
 from tag_manager_mcp import auth
 from tag_manager_mcp.access import (
+    SCOPE_DELETE_CONTAINERS,
     SCOPE_EDIT_CONTAINERS,
     SCOPE_EDIT_CONTAINERVERSIONS,
+    SCOPE_MANAGE_ACCOUNTS,
+    SCOPE_MANAGE_USERS,
     SCOPE_PUBLISH,
     SCOPE_READONLY,
     AccessModeError,
@@ -147,6 +150,7 @@ def test_cached_token_with_exact_scopes_in_different_order_accepted(tmp_path: Pa
         ({"GTM_ACCESS_MODE": "read"}, "token-read.json"),
         ({"GTM_ACCESS_MODE": "write"}, "token-write.json"),
         ({"GTM_ACCESS_MODE": "publish"}, "token-publish.json"),
+        ({"GTM_ACCESS_MODE": "admin"}, "token-admin.json"),
     ],
 )
 def test_default_token_file_path_is_scoped_per_mode(
@@ -154,6 +158,38 @@ def test_default_token_file_path_is_scoped_per_mode(
 ) -> None:
     provider = CredentialProvider(env)
     assert provider.token_file == Path.home() / ".config/gtm-mcp" / expected_name
+
+
+def test_admin_mode_cached_token_exact_scope_match(tmp_path: Path) -> None:
+    token_file = tmp_path / "token-admin.json"
+
+    # A publish token lacks admin scopes and must be rejected in admin mode.
+    _write_token(token_file, list(scopes_for_mode("publish")))
+    admin_provider = CredentialProvider(
+        {
+            "GTM_AUTH_MODE": "user",
+            "GTM_ACCESS_MODE": "admin",
+            "GTM_OAUTH_TOKEN_FILE": str(token_file),
+        }
+    )
+    with pytest.raises(AuthenticationError, match="GTM_ACCESS_MODE=admin"):
+        admin_provider.get_credentials(interactive=False)
+
+    # An exact admin token succeeds in admin mode, and is rejected in publish mode.
+    _write_token(token_file, list(scopes_for_mode("admin")))
+    result = admin_provider.get_credentials(interactive=False)
+    assert result.method == "user-oauth"
+    assert set(result.credentials.scopes or ()) == set(scopes_for_mode("admin"))
+
+    publish_provider = CredentialProvider(
+        {
+            "GTM_AUTH_MODE": "user",
+            "GTM_ACCESS_MODE": "publish",
+            "GTM_OAUTH_TOKEN_FILE": str(token_file),
+        }
+    )
+    with pytest.raises(AuthenticationError, match="GTM_ACCESS_MODE=publish"):
+        publish_provider.get_credentials(interactive=False)
 
 
 def test_explicit_oauth_token_file_overrides_default(tmp_path: Path) -> None:
@@ -350,6 +386,18 @@ def test_cached_token_lacking_scope_reruns_consent_flow_interactively(
         (
             "publish",
             (SCOPE_READONLY, SCOPE_EDIT_CONTAINERS, SCOPE_EDIT_CONTAINERVERSIONS, SCOPE_PUBLISH),
+        ),
+        (
+            "admin",
+            (
+                SCOPE_READONLY,
+                SCOPE_EDIT_CONTAINERS,
+                SCOPE_EDIT_CONTAINERVERSIONS,
+                SCOPE_PUBLISH,
+                SCOPE_DELETE_CONTAINERS,
+                SCOPE_MANAGE_ACCOUNTS,
+                SCOPE_MANAGE_USERS,
+            ),
         ),
     ],
 )
