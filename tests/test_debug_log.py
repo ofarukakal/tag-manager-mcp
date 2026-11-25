@@ -3,12 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from typing import Any
 
 import pytest
 
 from tag_manager_mcp import server
-from tag_manager_mcp.debug_log import DebugCallLogger, sanitize, sanitize_uri
+from tag_manager_mcp.debug_log import (
+    _MAX_SANITIZE_TEXT_BYTES,
+    DebugCallLogger,
+    _sanitize_text,
+    sanitize,
+    sanitize_uri,
+)
 
 
 def test_sanitize_redacts_nested_secrets() -> None:
@@ -200,3 +207,54 @@ def test_logging_fastmcp_call_tool_redacts_secrets_in_json_string_payloads(
     ):
         assert secret not in recent_dump
     assert "[REDACTED]" in recent_dump
+
+
+@pytest.mark.parametrize("n", [60, 200, 5000])
+def test_sanitize_text_no_catastrophic_backtracking(n: int) -> None:
+    double_quoted = r'\"refresh_token\": \"' + "\\" * n + '"'
+    single_quoted = r"\'refresh_token\': \'" + "\\" * n + "'"
+    for payload in (double_quoted, single_quoted):
+        start = time.monotonic()
+        result = _sanitize_text(payload)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5
+        assert result == payload
+
+
+def test_sanitize_text_escaped_quotes_and_single_quotes() -> None:
+    assert _sanitize_text(r'\"authorizationCode\": \"SECRET\"') == (
+        r'\"authorizationCode\": \"[REDACTED]\"'
+    )
+    assert _sanitize_text(r'\"refresh_token\": \"a\\\"b\"') == (
+        r'\"refresh_token\": \"[REDACTED]\"'
+    )
+    assert _sanitize_text(r'{"text": "{\"refresh_token\": \"a\\\"b\", \"ok\": true}"}') == (
+        r'{"text": "{\"refresh_token\": \"[REDACTED]\", \"ok\": true}"}'
+    )
+    assert _sanitize_text(r'\"refresh_token\": \"a\\\\\"b\"') == (
+        r'\"refresh_token\": \"[REDACTED]\"b\"'
+    )
+    assert _sanitize_text(r"\'authorizationCode\': \'SECRET\'") == (
+        r"\'authorizationCode\': \'[REDACTED]\'"
+    )
+    assert _sanitize_text(r"\'refresh_token\': \'a\\\'b\'") == (
+        r"\'refresh_token\': \'[REDACTED]\'"
+    )
+    assert _sanitize_text(r"{'text': '\'refresh_token\': \'a\\\'b\', \'ok\': true'}") == (
+        r"{'text': '\'refresh_token\': \'[REDACTED]\', \'ok\': true'}"
+    )
+
+
+def test_sanitize_text_truncates_oversized_strings_before_redaction() -> None:
+    oversized = '"refresh_token": "SECRET"' + ("x" * _MAX_SANITIZE_TEXT_BYTES)
+    expected_bytes = len(oversized.encode("utf-8"))
+    result = _sanitize_text(oversized)
+    assert result == f"[TRUNCATED {expected_bytes} bytes]"
+    assert "SECRET" not in result
+
+    prefix = '"refresh_token": "SECRET"'
+    at_limit = prefix + ("x" * (_MAX_SANITIZE_TEXT_BYTES - len(prefix)))
+    assert len(at_limit.encode("utf-8")) == _MAX_SANITIZE_TEXT_BYTES
+    redacted = _sanitize_text(at_limit)
+    assert "SECRET" not in redacted
+    assert redacted.startswith('"refresh_token": "[REDACTED]"')

@@ -308,7 +308,7 @@ def test_direct_call_guard_refuses_all_write_and_publish_tools_in_read_mode(
     with pytest.raises(AccessDeniedError):
         server.create_version("1", "2", "3", name="v1")
     with pytest.raises(AccessDeniedError):
-        server.publish_version("1", "2", "3", "approval-1", confirm=True)
+        asyncio.run(server.publish_version("1", "2", "3", "approval-1", confirm=True))
 
 
 def test_direct_call_guard_blocks_publish_in_write_mode_and_preserves_confirm(
@@ -372,14 +372,18 @@ def test_direct_call_guard_blocks_publish_in_write_mode_and_preserves_confirm(
 
     monkeypatch.setenv("GTM_ACCESS_MODE", "write")
     with pytest.raises(AccessDeniedError):
-        server.publish_version("1", "2", "3", req["approval_id"], confirm=True)
+        asyncio.run(server.publish_version("1", "2", "3", req["approval_id"], confirm=True))
 
     monkeypatch.setenv("GTM_ACCESS_MODE", "publish")
-    unconfirmed = server.publish_version("1", "2", "3", req["approval_id"], confirm=False)
+    unconfirmed = asyncio.run(
+        server.publish_version("1", "2", "3", req["approval_id"], confirm=False)
+    )
     assert unconfirmed["ok"] is False
     assert "confirm=true" in unconfirmed["message"]
 
-    confirmed = server.publish_version("1", "2", "3", req["approval_id"], confirm=True)
+    confirmed = asyncio.run(
+        server.publish_version("1", "2", "3", req["approval_id"], confirm=True)
+    )
     assert confirmed == {
         "ok": True,
         "result": {"containerVersion": {"path": "accounts/1/containers/2/versions/3"}},

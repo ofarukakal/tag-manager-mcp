@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 import pytest
@@ -949,3 +950,320 @@ def test_import_treats_parent_folder_id_zero_as_no_folder() -> None:
     assert len(ops.created_bodies) == 3
     for _kind, body in ops.created_bodies:
         assert "parentFolderId" not in body
+
+
+def test_apply_import_renames_custom_template_info_display_name_and_preserves_rest() -> None:
+    info_obj = {
+        "type": "TAG",
+        "id": "cvt_temp_public_id",
+        "version": 1,
+        "displayName": "Facebook Pixel",
+        "description": "Pixel template — café",
+    }
+    tail = (
+        "\n\n\n___TEMPLATE_PARAMETERS___\n\n[]\n\n\n"
+        "___SANDBOXED_JS_FOR_WEB_TEMPLATE___\n\nconst log = require('logToConsole');\r\n"
+    )
+    template_data = "___INFO___\n\n" + json.dumps(info_obj, indent=2, ensure_ascii=False) + tail
+    gallery_ref = {"host": "gtm", "owner": "facebook", "repository": "pixel", "version": "1"}
+    export = {
+        "exportFormatVersion": 2,
+        "containerVersion": {
+            "customTemplate": [
+                {
+                    "templateId": "10",
+                    "name": "Facebook Pixel",
+                    "galleryReference": gallery_ref,
+                    "templateData": template_data,
+                }
+            ],
+            "tag": [
+                {
+                    "tagId": "40",
+                    "name": "FB Tag",
+                    "type": "cvt_999_10",
+                }
+            ],
+        },
+    }
+    existing = {"customTemplate": [{"templateId": "500", "name": "Facebook Pixel"}]}
+
+    rename_plan = plan_import(export, existing, mode="merge", conflict="rename")
+    assert rename_plan["warnings"] == [
+        "customTemplate 'Facebook Pixel (imported)': gallery link is not preserved; "
+        "imported as a local copy."
+    ]
+    rename_ops = FakeImportOps()
+    rename_result = apply_import(rename_plan, export, rename_ops, "1", "777", "2")
+    assert rename_result["errors"] == []
+
+    tpl_body = next(body for kind, body in rename_ops.created_bodies if kind == "templates")
+    assert tpl_body["name"] == "Facebook Pixel (imported)"
+    assert "galleryReference" not in tpl_body
+    updated_td = tpl_body["templateData"]
+    assert updated_td.startswith("___INFO___\n\n")
+    assert updated_td.endswith(tail)
+    info_json_part = updated_td[len("___INFO___\n\n") : len(updated_td) - len(tail)]
+    parsed_info = json.loads(info_json_part)
+    assert parsed_info["displayName"] == "Facebook Pixel (imported)"
+    assert parsed_info["description"] == "Pixel template — café"
+    assert info_json_part == json.dumps(
+        {**info_obj, "displayName": "Facebook Pixel (imported)"},
+        indent=2,
+        ensure_ascii=False,
+    )
+    tag_body = next(body for kind, body in rename_ops.created_bodies if kind == "tags")
+    new_tpl_id = rename_result["created"]["customTemplate"][0]["id"]
+    assert tag_body["type"] == f"cvt_777_{new_tpl_id}"
+
+    # Overwrite keeps the existing name and leaves templateData untouched.
+    ow_plan = plan_import(export, existing, mode="merge", conflict="overwrite")
+    assert ow_plan["warnings"] == [
+        "customTemplate 'Facebook Pixel': gallery link is not preserved; "
+        "imported as a local copy."
+    ]
+    ow_ops = FakeImportOps()
+    ow_result = apply_import(ow_plan, export, ow_ops, "1", "777", "2")
+    assert ow_result["errors"] == []
+    assert ow_ops.updated_bodies[0][2]["name"] == "Facebook Pixel"
+    assert "galleryReference" not in ow_ops.updated_bodies[0][2]
+    assert ow_ops.updated_bodies[0][2]["templateData"] == template_data
+
+
+@pytest.mark.parametrize(
+    "bad_template_data",
+    [
+        "const log = require('logToConsole');",
+        "___INFO___\n\n{not valid json}\n\n___TEMPLATE_PARAMETERS___\n[]\n",
+    ],
+)
+def test_apply_import_rename_custom_template_unparsable_info_warns_and_sends_unchanged(
+    bad_template_data: str,
+) -> None:
+    export = {
+        "exportFormatVersion": 2,
+        "containerVersion": {
+            "customTemplate": [
+                {
+                    "templateId": "10",
+                    "name": "Broken Pixel",
+                    "templateData": bad_template_data,
+                }
+            ]
+        },
+    }
+    existing = {"customTemplate": [{"templateId": "500", "name": "Broken Pixel"}]}
+
+    plan = plan_import(export, existing, mode="merge", conflict="rename")
+    assert any("displayName could not be updated" in w for w in plan["warnings"])
+
+    ops = FakeImportOps()
+    result = apply_import(plan, export, ops, "1", "777", "2")
+
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["kind"] == "customTemplate"
+    assert result["errors"][0]["name"] == "Broken Pixel (imported)"
+    assert "displayName could not be updated" in result["errors"][0]["error"]
+    tpl_body = next(body for kind, body in ops.created_bodies if kind == "templates")
+    assert tpl_body["name"] == "Broken Pixel (imported)"
+    assert tpl_body["templateData"] == bad_template_data
+
+
+def test_apply_import_orders_tags_with_tag_reference_parameters_and_cycles() -> None:
+    export = {
+        "exportFormatVersion": 2,
+        "containerVersion": {
+            "tag": [
+                {
+                    "tagId": "1",
+                    "name": "Alpha",
+                    "type": "html",
+                    "parameter": [
+                        {"type": "TAG_REFERENCE", "key": "targetTag", "value": "Zeta"}
+                    ],
+                },
+                {"tagId": "2", "name": "Zeta", "type": "html"},
+            ]
+        },
+    }
+    plan = plan_import(export, existing={})
+    ops = FakeImportOps()
+
+    result = apply_import(plan, export, ops, "1", "777", "2")
+
+    assert result["errors"] == []
+    assert [item["name"] for item in result["created"]["tag"]] == ["Zeta", "Alpha"]
+
+    # Cycles must not loop forever and should fall back to name order.
+    cycle_export = {
+        "exportFormatVersion": 2,
+        "containerVersion": {
+            "tag": [
+                {
+                    "tagId": "1",
+                    "name": "Alpha",
+                    "type": "html",
+                    "parameter": [
+                        {"type": "TAG_REFERENCE", "key": "targetTag", "value": "Zeta"}
+                    ],
+                },
+                {
+                    "tagId": "2",
+                    "name": "Zeta",
+                    "type": "html",
+                    "parameter": [
+                        {"type": "TAG_REFERENCE", "key": "targetTag", "value": "Alpha"}
+                    ],
+                },
+            ]
+        },
+    }
+    cycle_plan = plan_import(cycle_export, existing={})
+    cycle_ops = FakeImportOps()
+    cycle_result = apply_import(cycle_plan, cycle_export, cycle_ops, "1", "777", "2")
+    assert cycle_result["errors"] == []
+    assert [item["name"] for item in cycle_result["created"]["tag"]] == ["Alpha", "Zeta"]
+
+
+def test_overwrite_deletes_referrers_before_referenced_within_kind() -> None:
+    export = {"exportFormatVersion": 2, "containerVersion": {"folder": []}}
+    existing = {
+        "trigger": [
+            {"triggerId": "10", "name": "Alpha Click", "type": "click"},
+            {
+                "triggerId": "20",
+                "name": "Zeta Group",
+                "type": "triggerGroup",
+                "parameter": [
+                    {
+                        "type": "list",
+                        "key": "triggerIds",
+                        "list": [{"type": "triggerReference", "value": "10"}],
+                    }
+                ],
+            },
+            {"triggerId": "11", "name": "Beta Click", "type": "click"},
+            {
+                "triggerId": "21",
+                "name": "Delta Linked",
+                "type": "customEvent",
+                "parameter": [{"type": "triggerReference", "key": "linked", "value": "11"}],
+            },
+        ],
+        "tag": [
+            {"tagId": "30", "name": "Alpha Setup", "type": "html"},
+            {
+                "tagId": "40",
+                "name": "Zeta Main",
+                "type": "html",
+                "setupTag": [{"tagName": "Alpha Setup"}],
+            },
+            {"tagId": "31", "name": "Beta Teardown", "type": "html"},
+            {
+                "tagId": "41",
+                "name": "Zeta TeardownMain",
+                "type": "html",
+                "teardownTag": [{"tagName": "Beta Teardown"}],
+            },
+            {"tagId": "32", "name": "Gamma Target", "type": "html"},
+            {
+                "tagId": "42",
+                "name": "Zeta RefMain",
+                "type": "html",
+                "parameter": [
+                    {"type": "tagReference", "key": "targetTag", "value": "Gamma Target"}
+                ],
+            },
+        ],
+    }
+
+    plan = plan_import(export, existing, mode="overwrite")
+    ops = FakeImportOps()
+    result = apply_import(plan, export, ops, "1", "777", "2")
+
+    assert result["errors"] == []
+    deleted_triggers = [item["name"] for item in result["deleted"]["trigger"]]
+    assert deleted_triggers.index("Zeta Group") < deleted_triggers.index("Alpha Click")
+    assert deleted_triggers.index("Delta Linked") < deleted_triggers.index("Beta Click")
+
+    deleted_tags = [item["name"] for item in result["deleted"]["tag"]]
+    assert deleted_tags.index("Zeta Main") < deleted_tags.index("Alpha Setup")
+    assert deleted_tags.index("Zeta TeardownMain") < deleted_tags.index("Beta Teardown")
+    assert deleted_tags.index("Zeta RefMain") < deleted_tags.index("Gamma Target")
+
+
+def test_apply_import_strips_gallery_reference_from_custom_template_and_warns() -> None:
+    template_data = (
+        '___INFO___\n\n{"type": "TAG", "displayName": "Gallery Pixel"}\n\n'
+        "___SANDBOXED_JS_FOR_WEB_TEMPLATE___\n\nconst log = require('logToConsole');\n"
+    )
+    export = {
+        "exportFormatVersion": 2,
+        "containerVersion": {
+            "customTemplate": [
+                {
+                    "templateId": "10",
+                    "name": "Gallery Pixel",
+                    "galleryReference": {
+                        "host": "gtm",
+                        "owner": "vendor",
+                        "repository": "gallery-pixel",
+                        "version": "abc123",
+                        "signature": "sig",
+                    },
+                    "templateData": template_data,
+                }
+            ],
+            "tag": [
+                {
+                    "tagId": "40",
+                    "name": "Pixel Tag",
+                    "type": "cvt_999_10",
+                }
+            ],
+        },
+    }
+
+    plan = plan_import(export, existing={})
+    assert plan["warnings"] == [
+        "customTemplate 'Gallery Pixel': gallery link is not preserved; "
+        "imported as a local copy."
+    ]
+
+    ops = FakeImportOps()
+    result = apply_import(plan, export, ops, "1", "777", "2")
+    assert result["errors"] == []
+
+    tpl_body = next(body for kind, body in ops.created_bodies if kind == "templates")
+    assert "galleryReference" not in tpl_body
+    assert tpl_body["name"] == "Gallery Pixel"
+    assert tpl_body["templateData"] == template_data
+
+    tag_body = next(body for kind, body in ops.created_bodies if kind == "tags")
+    new_tpl_id = result["created"]["customTemplate"][0]["id"]
+    assert tag_body["type"] == f"cvt_777_{new_tpl_id}"
+
+
+def test_plan_import_custom_template_without_gallery_reference_has_no_gallery_warning() -> None:
+    export = {
+        "exportFormatVersion": 2,
+        "containerVersion": {
+            "customTemplate": [
+                {
+                    "templateId": "10",
+                    "name": "Local Pixel",
+                    "templateData": "const log = require('logToConsole');",
+                }
+            ]
+        },
+    }
+
+    plan = plan_import(export, existing={})
+    assert plan["warnings"] == []
+
+    ops = FakeImportOps()
+    result = apply_import(plan, export, ops, "1", "777", "2")
+    assert result["errors"] == []
+    tpl_body = next(body for kind, body in ops.created_bodies if kind == "templates")
+    assert "galleryReference" not in tpl_body
+    assert tpl_body["templateData"] == "const log = require('logToConsole');"

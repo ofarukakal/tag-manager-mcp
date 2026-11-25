@@ -21,6 +21,7 @@ APPROVAL_FILE_ENV_VAR = "GTM_PUBLISH_APPROVAL_FILE"
 DEFAULT_APPROVAL_FILE = Path.home() / ".config/gtm-mcp/publish-approvals.json"
 DEFAULT_TTL_SECONDS = 600
 MAX_TTL_SECONDS = 86400
+MAX_CANCEL_REASON_LENGTH = 200
 STATE_SCHEMA_VERSION = 1
 
 STATUS_PENDING = "pending"
@@ -32,6 +33,10 @@ STATUS_CANCELLED = "cancelled"
 TARGET_LIVE = "live"
 TARGET_LATEST = "latest"
 TARGET_ENVIRONMENT_PREFIX = "environment:"
+
+APPROVED_VIA_TERMINAL = "terminal"
+APPROVED_VIA_ELICITATION = "elicitation"
+VALID_APPROVED_VIA = frozenset({APPROVED_VIA_TERMINAL, APPROVED_VIA_ELICITATION})
 
 VALID_STATUSES = frozenset(
     {
@@ -218,6 +223,18 @@ def _validate_state(data: Any, state_file: Path) -> dict[str, Any]:
             _parse_iso_utc(record.get("approved_at"), "approved_at", state_file)
         if status == STATUS_USED:
             _parse_iso_utc(record.get("used_at"), "used_at", state_file)
+        approved_via = record.get("approved_via")
+        if approved_via is not None and approved_via not in VALID_APPROVED_VIA:
+            raise ApprovalStateError(
+                f"Corrupt publish approval state file {state_file}: "
+                f"request {key!r} has invalid approved_via {approved_via!r}"
+            )
+        reason = record.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise ApprovalStateError(
+                f"Corrupt publish approval state file {state_file}: "
+                f"request {key!r} has invalid reason"
+            )
 
     return {"version": STATE_SCHEMA_VERSION, "requests": requests}
 
@@ -443,6 +460,7 @@ def create_request(
             "expires_at": expires_at.isoformat(),
             "status": STATUS_PENDING,
             "approved_at": None,
+            "approved_via": None,
             "used_at": None,
         }
         requests[approval_id] = record
@@ -499,20 +517,17 @@ def list_requests(
     return results
 
 
-def approve_request(
+def _approve_record(
     approval_id: str,
     *,
     typed_public_id: str,
+    approved_via: str,
+    require_click: bool = False,
+    clicked: bool = False,
     now: NowInput = None,
     path: str | Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Approve a pending, unexpired request when ``typed_public_id`` matches exactly.
-
-    Marks expired requests as ``expired``. On any other failure (unknown ID,
-    wrong typed ID, or non-pending status), leaves the state file unchanged and
-    raises ``PublishApprovalError``.
-    """
     state_file = get_approval_file(path, env=env)
     current_time = _resolve_now(now)
 
@@ -571,9 +586,143 @@ def approve_request(
                 f"Container public ID mismatch for request {approval_id!r}: "
                 f"expected {record['public_id']!r}, got {cleaned!r}."
             )
+        if require_click and clicked is not True:
+            raise PublishApprovalError(
+                f"Publish approval request {approval_id!r} requires explicit click confirmation."
+            )
 
         record["status"] = STATUS_APPROVED
         record["approved_at"] = current_time.isoformat()
+        record["approved_via"] = approved_via
+        _write_state_atomic(state_file, state)
+        return copy.deepcopy(record)
+
+
+def approve_request(
+    approval_id: str,
+    *,
+    typed_public_id: str,
+    now: NowInput = None,
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Approve a pending, unexpired request via the terminal CLI when ``typed_public_id`` matches.
+
+    Marks expired requests as ``expired``. On any other failure (unknown ID,
+    wrong typed ID, or non-pending status), leaves the state file unchanged and
+    raises ``PublishApprovalError``.
+    """
+    return _approve_record(
+        approval_id,
+        typed_public_id=typed_public_id,
+        approved_via=APPROVED_VIA_TERMINAL,
+        require_click=False,
+        now=now,
+        path=path,
+        env=env,
+    )
+
+
+def approve_via_elicitation(
+    approval_id: str,
+    *,
+    typed_public_id: str,
+    clicked: bool,
+    now: NowInput = None,
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Approve a pending, unexpired request via two-step MCP elicitation.
+
+    Applies the same checks as ``approve_request`` (pending, unexpired, exact
+    public ID match) and also requires ``clicked is True``. Records
+    ``approved_via='elicitation'`` on success.
+    """
+    return _approve_record(
+        approval_id,
+        typed_public_id=typed_public_id,
+        approved_via=APPROVED_VIA_ELICITATION,
+        require_click=True,
+        clicked=clicked,
+        now=now,
+        path=path,
+        env=env,
+    )
+
+
+def _normalize_cancel_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    if not isinstance(reason, str):
+        raise TypeError("reason must be a string or None")
+    collapsed = " ".join(reason.split())
+    if not collapsed:
+        return None
+    if len(collapsed) > MAX_CANCEL_REASON_LENGTH:
+        return collapsed[: MAX_CANCEL_REASON_LENGTH - 3] + "..."
+    return collapsed
+
+
+def cancel_request(
+    approval_id: str,
+    *,
+    reason: str | None = None,
+    now: NowInput = None,
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Cancel a pending or approved publish approval request (or mark expired if past expiry).
+
+    Refuses with ``PublishApprovalError`` for ``used``, ``expired``, or
+    ``cancelled`` requests. Returns a copy of the record if cancelled, or None
+    if unknown or no state file exists.
+    """
+    clean_reason = _normalize_cancel_reason(reason)
+    state_file = get_approval_file(path, env=env)
+    current_time = _resolve_now(now)
+
+    try:
+        exists = state_file.exists()
+    except OSError as exc:
+        raise ApprovalStateError(
+            f"Unreadable publish approval state file {state_file}: {exc}"
+        ) from exc
+    if not exists:
+        return None
+
+    with _exclusive_state_lock(state_file):
+        state = _read_state(state_file, allow_missing=False)
+        record = state["requests"].get(approval_id) if isinstance(approval_id, str) else None
+        if record is None:
+            return None
+        status = record["status"]
+        if status == STATUS_USED:
+            raise PublishApprovalError(
+                f"Publish approval request {approval_id!r} has already been used."
+            )
+        if status == STATUS_CANCELLED:
+            raise PublishApprovalError(
+                f"Publish approval request {approval_id!r} was already cancelled."
+            )
+        if status == STATUS_EXPIRED:
+            raise PublishApprovalError(
+                f"Publish approval request {approval_id!r} has expired."
+            )
+        if status not in OPEN_STATUSES:
+            raise PublishApprovalError(
+                f"Publish approval request {approval_id!r} cannot be cancelled "
+                f"(status: {status!r})."
+            )
+        if _is_expired(record, current_time, state_file):
+            record["status"] = STATUS_EXPIRED
+            _write_state_atomic(state_file, state)
+            raise PublishApprovalError(
+                f"Publish approval request {approval_id!r} has expired."
+            )
+        record["status"] = STATUS_CANCELLED
+        record["cancelled_at"] = current_time.isoformat()
+        if clean_reason is not None:
+            record["reason"] = clean_reason
         _write_state_atomic(state_file, state)
         return copy.deepcopy(record)
 

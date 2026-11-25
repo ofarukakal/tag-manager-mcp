@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from pathlib import Path
@@ -20,7 +21,10 @@ class RecordingFake:
     def __getattr__(self, name: str) -> Any:
         def _method(*args: Any, **kwargs: Any) -> dict[str, Any]:
             self.calls.append((name, args, kwargs))
-            return {"called": name, "args": list(args), "kwargs": kwargs}
+            result: dict[str, Any] = {"called": name, "args": list(args), "kwargs": kwargs}
+            if name == "get_environment":
+                result["type"] = "user"
+            return result
 
         return _method
 
@@ -199,7 +203,12 @@ def test_write_mode_tools_pass_through_and_block_in_read_mode(
             assert res["result"]["called"] == expected_method
         else:
             assert res["called"] == expected_method
-    assert [c[0] for c in writer.calls] == [expected for expected, _, _, _ in calls]
+    expected_calls: list[str] = []
+    for expected, _, _, _ in calls:
+        if expected in ("update_environment", "delete_environment"):
+            expected_calls.append("get_environment")
+        expected_calls.append(expected)
+    assert [c[0] for c in writer.calls] == expected_calls
 
 
 def test_reauthorize_environment_requires_publish(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -357,6 +366,8 @@ def test_confirm_guarded_tools_refuse_without_confirm_and_do_not_call_api(
 
     func = getattr(server, tool_name)
     result = func(*args, **kwargs, confirm=False)
+    if inspect.iscoroutine(result):
+        result = asyncio.run(result)
     assert result["ok"] is False
     assert "confirm=true" in result["message"]
 
@@ -437,3 +448,107 @@ def test_environment_authorization_code_redacted_except_reauthorize(
     monkeypatch.setenv("GTM_ACCESS_MODE", "publish")
     reauthorized = server.reauthorize_environment("1", "2", "7")
     assert reauthorized["authorizationCode"] == "fresh-rotated-secret"
+
+
+@pytest.mark.parametrize("env_type", ["live", "latest", "workspace", "other"])
+def test_environment_update_and_delete_refuse_non_user_types(
+    env_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "write")
+
+    class FakeTypedEnvWriter:
+        def __init__(self) -> None:
+            self.update_calls: list[tuple[Any, ...]] = []
+            self.delete_calls: list[tuple[Any, ...]] = []
+
+        def get_environment(
+            self, account_id: str, container_id: str, environment_id: str
+        ) -> dict[str, Any]:
+            return {
+                "environmentId": environment_id,
+                "name": "Managed",
+                "type": env_type,
+            }
+
+        def update_environment(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            self.update_calls.append((args, kwargs))
+            return {}
+
+        def delete_environment(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            self.delete_calls.append((args, kwargs))
+            return {}
+
+    writer = FakeTypedEnvWriter()
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    expected_msg = (
+        f"Environment 5 is of type '{env_type}'; "
+        "only user-created environments can be changed here."
+    )
+
+    update_res = server.update_environment("1", "2", "5", {"name": "New"})
+    assert update_res == {"ok": False, "message": expected_msg}
+
+    delete_no_confirm = server.delete_environment("1", "2", "5", confirm=False)
+    assert delete_no_confirm["ok"] is False
+    assert "confirm=true" in delete_no_confirm["message"]
+
+    delete_res = server.delete_environment("1", "2", "5", confirm=True)
+    assert delete_res == {"ok": False, "message": expected_msg}
+
+    assert writer.update_calls == []
+    assert writer.delete_calls == []
+
+
+@pytest.mark.parametrize("env_type", ["absent", None, "", "user"])
+def test_environment_update_and_delete_allow_user_and_untyped_environments(
+    env_type: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "write")
+
+    class FakeUserEnvWriter:
+        def __init__(self) -> None:
+            self.update_calls: list[tuple[Any, ...]] = []
+            self.delete_calls: list[tuple[Any, ...]] = []
+
+        def get_environment(
+            self, account_id: str, container_id: str, environment_id: str
+        ) -> dict[str, Any]:
+            env: dict[str, Any] = {
+                "environmentId": environment_id,
+                "name": "Staging",
+                "fingerprint": "fp-5",
+            }
+            if env_type != "absent":
+                env["type"] = env_type
+            return env
+
+        def update_environment(
+            self,
+            account_id: str,
+            container_id: str,
+            environment_id: str,
+            body: dict[str, Any],
+            fingerprint: str | None = None,
+        ) -> dict[str, Any]:
+            self.update_calls.append((account_id, container_id, environment_id, body, fingerprint))
+            return {**body, "environmentId": environment_id}
+
+        def delete_environment(
+            self, account_id: str, container_id: str, environment_id: str
+        ) -> dict[str, Any]:
+            self.delete_calls.append((account_id, container_id, environment_id))
+            return {"deleted": environment_id}
+
+    writer = FakeUserEnvWriter()
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    update_res = server.update_environment("1", "2", "5", {"name": "New"})
+    assert update_res["name"] == "New"
+    assert len(writer.update_calls) == 1
+
+    delete_res = server.delete_environment("1", "2", "5", confirm=True)
+    assert delete_res == {"ok": True, "result": {"deleted": "5"}}
+    assert writer.delete_calls == [("1", "2", "5")]

@@ -12,6 +12,8 @@ import pytest
 
 from tag_manager_mcp.publish_guard import (
     APPROVAL_FILE_ENV_VAR,
+    APPROVED_VIA_ELICITATION,
+    APPROVED_VIA_TERMINAL,
     STATUS_APPROVED,
     STATUS_CANCELLED,
     STATUS_EXPIRED,
@@ -20,6 +22,8 @@ from tag_manager_mcp.publish_guard import (
     ApprovalStateError,
     PublishApprovalError,
     approve_request,
+    approve_via_elicitation,
+    cancel_request,
     consume_approval,
     create_request,
     get_approval_file,
@@ -714,3 +718,239 @@ def test_legacy_request_without_target_field_is_treated_as_live(tmp_path: Path) 
         path=state_file,
     )
     assert consumed["status"] == STATUS_USED
+
+
+def test_approve_request_records_terminal_and_approve_via_elicitation_records_elicitation(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "approvals.json"
+    req_term = _create_sample(state_file, container_id="201", public_id="GTM-TERM1", now=BASE_TIME)
+    assert req_term["approved_via"] is None
+    approved_term = approve_request(
+        req_term["approval_id"],
+        typed_public_id="GTM-TERM1",
+        now=BASE_TIME + timedelta(seconds=5),
+        path=state_file,
+    )
+    assert approved_term["status"] == STATUS_APPROVED
+    assert approved_term["approved_via"] == APPROVED_VIA_TERMINAL
+
+    req_elicit = _create_sample(
+        state_file, container_id="202", public_id="GTM-ELIC1", now=BASE_TIME
+    )
+    # clicked=False or truthy non-bool must fail closed and leave request pending.
+    for bad_clicked in (False, 1, "true", None):
+        with pytest.raises(PublishApprovalError, match="click confirmation"):
+            approve_via_elicitation(
+                req_elicit["approval_id"],
+                typed_public_id="GTM-ELIC1",
+                clicked=bad_clicked,  # type: ignore[arg-type]
+                now=BASE_TIME + timedelta(seconds=5),
+                path=state_file,
+            )
+        assert get_request(req_elicit["approval_id"], path=state_file)["status"] == STATUS_PENDING
+
+    # Wrong case public ID fails closed.
+    with pytest.raises(PublishApprovalError, match="mismatch"):
+        approve_via_elicitation(
+            req_elicit["approval_id"],
+            typed_public_id="gtm-elic1",
+            clicked=True,
+            now=BASE_TIME + timedelta(seconds=6),
+            path=state_file,
+        )
+    assert get_request(req_elicit["approval_id"], path=state_file)["status"] == STATUS_PENDING
+
+    # Exact public ID (with whitespace stripped) and clicked=True succeeds.
+    approved_elicit = approve_via_elicitation(
+        req_elicit["approval_id"],
+        typed_public_id="  GTM-ELIC1 \n",
+        clicked=True,
+        now=BASE_TIME + timedelta(seconds=7),
+        path=state_file,
+    )
+    assert approved_elicit["status"] == STATUS_APPROVED
+    assert approved_elicit["approved_via"] == APPROVED_VIA_ELICITATION
+    assert approved_elicit["approved_at"] == (BASE_TIME + timedelta(seconds=7)).isoformat()
+
+    # Re-approving an already approved request fails.
+    with pytest.raises(PublishApprovalError, match="already approved"):
+        approve_via_elicitation(
+            req_elicit["approval_id"],
+            typed_public_id="GTM-ELIC1",
+            clicked=True,
+            now=BASE_TIME + timedelta(seconds=8),
+            path=state_file,
+        )
+
+    # consume_approval accepts elicitation-approved request and marks it used.
+    consumed = consume_approval(
+        req_elicit["approval_id"],
+        account_id="100",
+        container_id="202",
+        version_id="7",
+        target="live",
+        current_live_version_id="6",
+        now=BASE_TIME + timedelta(seconds=9),
+        path=state_file,
+    )
+    assert consumed["status"] == STATUS_USED
+    assert consumed["approved_via"] == APPROVED_VIA_ELICITATION
+
+
+def test_approve_via_elicitation_marks_expired_and_cancel_request_cancels_pending(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "approvals.json"
+    req_exp = _create_sample(state_file, container_id="301", ttl_seconds=30, now=BASE_TIME)
+    with pytest.raises(PublishApprovalError, match="expired"):
+        approve_via_elicitation(
+            req_exp["approval_id"],
+            typed_public_id="GTM-ABC123",
+            clicked=True,
+            now=BASE_TIME + timedelta(seconds=30),
+            path=state_file,
+        )
+    assert get_request(req_exp["approval_id"], path=state_file)["status"] == STATUS_EXPIRED
+
+    req_cancel = _create_sample(state_file, container_id="302", now=BASE_TIME)
+    cancelled = cancel_request(
+        req_cancel["approval_id"],
+        now=BASE_TIME + timedelta(seconds=5),
+        path=state_file,
+    )
+    assert cancelled is not None
+    assert cancelled["status"] == STATUS_CANCELLED
+    assert get_request(req_cancel["approval_id"], path=state_file)["status"] == STATUS_CANCELLED
+
+    # Cancelling an already-approved terminal request cancels it and records reason.
+    req_term = _create_sample(state_file, container_id="303", now=BASE_TIME)
+    approve_request(
+        req_term["approval_id"],
+        typed_public_id="GTM-ABC123",
+        now=BASE_TIME + timedelta(seconds=5),
+        path=state_file,
+    )
+    cancelled_term = cancel_request(
+        req_term["approval_id"],
+        reason="Live container version changed",
+        now=BASE_TIME + timedelta(seconds=6),
+        path=state_file,
+    )
+    assert cancelled_term is not None
+    assert cancelled_term["status"] == STATUS_CANCELLED
+    assert cancelled_term["approved_via"] == APPROVED_VIA_TERMINAL
+    assert cancelled_term["reason"] == "Live container version changed"
+    open_ids = {
+        item["approval_id"]
+        for item in list_requests(path=state_file, now=BASE_TIME + timedelta(seconds=6))
+    }
+    assert cancelled_term["approval_id"] not in open_ids
+
+    # Cancelling an already-approved elicitation request cancels it too.
+    req_elicit = _create_sample(state_file, container_id="304", now=BASE_TIME)
+    approve_via_elicitation(
+        req_elicit["approval_id"],
+        typed_public_id="GTM-ABC123",
+        clicked=True,
+        now=BASE_TIME + timedelta(seconds=5),
+        path=state_file,
+    )
+    cancelled_elicit = cancel_request(
+        req_elicit["approval_id"],
+        reason="  " + ("x" * 250) + "\n",
+        now=BASE_TIME + timedelta(seconds=6),
+        path=state_file,
+    )
+    assert cancelled_elicit is not None
+    assert cancelled_elicit["status"] == STATUS_CANCELLED
+    assert len(cancelled_elicit["reason"]) == 200
+    assert cancelled_elicit["reason"].endswith("...")
+
+    # Cancelling a used, already-cancelled, or expired request refuses with PublishApprovalError.
+    req_used = _create_sample(state_file, container_id="305", now=BASE_TIME)
+    approve_request(
+        req_used["approval_id"],
+        typed_public_id="GTM-ABC123",
+        now=BASE_TIME + timedelta(seconds=5),
+        path=state_file,
+    )
+    consume_approval(
+        req_used["approval_id"],
+        account_id="100",
+        container_id="305",
+        version_id="7",
+        target="live",
+        current_live_version_id="6",
+        now=BASE_TIME + timedelta(seconds=6),
+        path=state_file,
+    )
+    with pytest.raises(PublishApprovalError, match="already been used"):
+        cancel_request(
+            req_used["approval_id"],
+            reason="too late",
+            now=BASE_TIME + timedelta(seconds=7),
+            path=state_file,
+        )
+    assert get_request(req_used["approval_id"], path=state_file)["status"] == STATUS_USED
+
+    with pytest.raises(PublishApprovalError, match="cancelled"):
+        cancel_request(
+            req_cancel["approval_id"],
+            now=BASE_TIME + timedelta(seconds=7),
+            path=state_file,
+        )
+
+    with pytest.raises(PublishApprovalError, match="expired"):
+        cancel_request(
+            req_exp["approval_id"],
+            now=BASE_TIME + timedelta(seconds=31),
+            path=state_file,
+        )
+
+    req_exp_open = _create_sample(state_file, container_id="306", ttl_seconds=10, now=BASE_TIME)
+    approve_request(
+        req_exp_open["approval_id"],
+        typed_public_id="GTM-ABC123",
+        now=BASE_TIME + timedelta(seconds=5),
+        path=state_file,
+    )
+    with pytest.raises(PublishApprovalError, match="expired"):
+        cancel_request(
+            req_exp_open["approval_id"],
+            now=BASE_TIME + timedelta(seconds=10),
+            path=state_file,
+        )
+    assert get_request(req_exp_open["approval_id"], path=state_file)["status"] == STATUS_EXPIRED
+
+
+def test_invalid_approved_via_in_state_file_fails_closed(tmp_path: Path) -> None:
+    state_file = tmp_path / "corrupt-via.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "requests": {
+                    "abc": {
+                        "approval_id": "abc",
+                        "account_id": "100",
+                        "container_id": "200",
+                        "public_id": "GTM-ABC123",
+                        "version_id": "7",
+                        "version_name": "v7",
+                        "live_version_id": "6",
+                        "diff_summary": {},
+                        "created_at": BASE_TIME.isoformat(),
+                        "expires_at": (BASE_TIME + timedelta(seconds=600)).isoformat(),
+                        "status": STATUS_APPROVED,
+                        "approved_at": (BASE_TIME + timedelta(seconds=1)).isoformat(),
+                        "approved_via": "magic-bypass",
+                        "used_at": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ApprovalStateError, match="approved_via"):
+        get_request("abc", path=state_file)

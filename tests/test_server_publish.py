@@ -62,6 +62,7 @@ class FakePublishWriter:
         self.environments: dict[str, dict[str, Any]] = {
             "7": {
                 "environmentId": "7",
+                "type": "user",
                 "name": "Staging",
                 "description": "QA env",
                 "url": "https://staging.example",
@@ -72,6 +73,7 @@ class FakePublishWriter:
             },
             "8": {
                 "environmentId": "8",
+                "type": "user",
                 "name": "Preview",
                 "containerVersionId": "10",
                 "fingerprint": "fp-env-8",
@@ -79,6 +81,7 @@ class FakePublishWriter:
             },
         }
         self.update_environment_calls: list[tuple[Any, ...]] = []
+        self.delete_environment_calls: list[tuple[str, str, str]] = []
         self.create_environment_calls: list[tuple[Any, ...]] = []
         self.reauthorize_environment_calls: list[tuple[Any, ...]] = []
         self.set_latest_calls: list[tuple[str, str, str]] = []
@@ -108,6 +111,12 @@ class FakePublishWriter:
         updated = {**self.environments[environment_id], **body}
         self.environments[environment_id] = updated
         return dict(updated)
+
+    def delete_environment(
+        self, account_id: str, container_id: str, environment_id: str
+    ) -> dict[str, Any]:
+        self.delete_environment_calls.append((account_id, container_id, environment_id))
+        return {"deleted": environment_id}
 
     def reauthorize_environment(
         self,
@@ -161,13 +170,15 @@ def test_invariant_i1_single_publish_version_call_site_in_server_source() -> Non
     """Invariant I1: `.publish_version(` occurs exactly once in server.py outside def line."""
     source = SERVER_SOURCE_PATH.read_text(encoding="utf-8")
     non_def_lines = [
-        line for line in source.splitlines() if not line.lstrip().startswith("def publish_version(")
+        line
+        for line in source.splitlines()
+        if not line.lstrip().startswith(("def publish_version(", "async def publish_version("))
     ]
     occurrences = sum(line.count(".publish_version(") for line in non_def_lines)
     assert occurrences == 1
 
     # Verify consume_approval appears before the single .publish_version( call.
-    func_start = source.index("def publish_version(")
+    func_start = source.index("async def publish_version(")
     func_body = source[func_start:]
     consume_pos = func_body.index("consume_approval(")
     publish_pos = func_body.index(".publish_version(")
@@ -199,7 +210,11 @@ def test_prepare_publish_creates_pending_request_with_diff_summary(
     assert prepared["version_name"] == "Release 11"
     assert prepared["replaces_live_version_id"] == "10"
     assert prepared["expires_at"]
-    assert f"tag-manager-approve {approval_id}" in prepared["next_step"]
+    assert prepared["next_step"] == (
+        "Call publish_version (or publish_to_environment / set_latest_version) with this "
+        "approval_id; your MCP client will ask you to type the container ID and then click "
+        "to confirm."
+    )
     assert prepared["summary"]["total_changes"] == 3
     assert prepared["summary"]["tag"] == {
         "added": ["Lead Event"],
@@ -246,7 +261,9 @@ def test_prepare_publish_handles_never_published_container_and_fallback_public_i
     publish_guard.approve_request(
         prepared["approval_id"], typed_public_id="GTM-FALLBACK", path=approval_file
     )
-    published = server.publish_version("1", "100", "1", prepared["approval_id"], confirm=True)
+    published = asyncio.run(
+        server.publish_version("1", "100", "1", prepared["approval_id"], confirm=True)
+    )
     assert published["ok"] is True
     assert client.publish_calls == [("1", "100", "1")]
 
@@ -265,33 +282,41 @@ def test_invariant_i3_publish_version_refusals_and_single_use_success(
     monkeypatch.setattr(server, "get_client", lambda: client)
 
     # 1. No approval id
-    no_id_omitted = server.publish_version("1", "100", "11", confirm=True)
+    no_id_omitted = asyncio.run(server.publish_version("1", "100", "11", confirm=True))
     assert no_id_omitted["ok"] is False
-    no_id_empty = server.publish_version("1", "100", "11", "", confirm=True)
+    no_id_empty = asyncio.run(server.publish_version("1", "100", "11", "", confirm=True))
     assert no_id_empty["ok"] is False
     assert client.publish_calls == []
 
     # 2. Unknown approval id
-    unknown = server.publish_version("1", "100", "11", "deadbeef00000000", confirm=True)
+    unknown = asyncio.run(
+        server.publish_version("1", "100", "11", "deadbeef00000000", confirm=True)
+    )
     assert unknown["ok"] is False
     assert client.publish_calls == []
 
-    # 3. Pending (unapproved) request
+    # 3. Pending (unapproved) request without elicitation capability
     prepared = server.prepare_publish("1", "100", "11")
     approval_id = prepared["approval_id"]
-    pending_res = server.publish_version("1", "100", "11", approval_id, confirm=True)
+    pending_res = asyncio.run(
+        server.publish_version("1", "100", "11", approval_id, confirm=True)
+    )
     assert pending_res["ok"] is False
-    assert "not been approved" in pending_res["message"]
+    assert "cannot show approval prompts" in pending_res["message"]
     assert client.publish_calls == []
 
     # Approve out-of-band (simulating `tag-manager-approve`)
     publish_guard.approve_request(approval_id, typed_public_id="GTM-TEST123", path=approval_file)
 
     # 4. Approved request for another version / container / account
-    wrong_version = server.publish_version("1", "100", "12", approval_id, confirm=True)
+    wrong_version = asyncio.run(
+        server.publish_version("1", "100", "12", approval_id, confirm=True)
+    )
     assert wrong_version["ok"] is False
     assert "version_id" in wrong_version["message"]
-    wrong_container = server.publish_version("1", "999", "11", approval_id, confirm=True)
+    wrong_container = asyncio.run(
+        server.publish_version("1", "999", "11", approval_id, confirm=True)
+    )
     assert wrong_container["ok"] is False
     assert client.publish_calls == []
 
@@ -301,23 +326,31 @@ def test_invariant_i3_publish_version_refusals_and_single_use_success(
         "name": "Hotfix",
         "container": {"publicId": "GTM-TEST123"},
     }
-    stale_live = server.publish_version("1", "100", "11", approval_id, confirm=True)
+    stale_live = asyncio.run(
+        server.publish_version("1", "100", "11", approval_id, confirm=True)
+    )
     assert stale_live["ok"] is False
     assert "Live container version changed" in stale_live["message"]
     assert client.publish_calls == []
 
-    # Restore original live version -> matching approved request succeeds once
+    # The approval refused at consume time is cancelled and no longer listed
+    assert publish_guard.get_request(approval_id, path=approval_file)["status"] == "cancelled"
+    assert server.list_publish_requests() == []
+
+    # Restore original live version -> a fresh, approved request succeeds once
     reader.live_payload = {
         "containerVersionId": "10",
         "name": "Live 10",
         "container": {"publicId": "GTM-TEST123"},
     }
-    ok_res = server.publish_version("1", "100", "11", approval_id, confirm=True)
+    approval_id = server.prepare_publish("1", "100", "11")["approval_id"]
+    publish_guard.approve_request(approval_id, typed_public_id="GTM-TEST123", path=approval_file)
+    ok_res = asyncio.run(server.publish_version("1", "100", "11", approval_id, confirm=True))
     assert ok_res["ok"] is True
     assert client.publish_calls == [("1", "100", "11")]
 
     # 6. Second call with the same already-used approval id is refused
-    replay = server.publish_version("1", "100", "11", approval_id, confirm=True)
+    replay = asyncio.run(server.publish_version("1", "100", "11", approval_id, confirm=True))
     assert replay["ok"] is False
     assert "already been used" in replay["message"]
     assert client.publish_calls == [("1", "100", "11")]
@@ -331,11 +364,11 @@ def test_prepare_and_list_publish_require_publish_mode(monkeypatch: pytest.Monke
     with pytest.raises(AccessDeniedError):
         server.list_publish_requests()
     with pytest.raises(AccessDeniedError):
-        server.publish_version("1", "100", "11", "abc", confirm=True)
+        asyncio.run(server.publish_version("1", "100", "11", "abc", confirm=True))
     with pytest.raises(AccessDeniedError):
-        server.publish_to_environment("1", "100", "7", "11", "abc", confirm=True)
+        asyncio.run(server.publish_to_environment("1", "100", "7", "11", "abc", confirm=True))
     with pytest.raises(AccessDeniedError):
-        server.set_latest_version("1", "100", "11", "abc", confirm=True)
+        asyncio.run(server.set_latest_version("1", "100", "11", "abc", confirm=True))
 
 
 def test_prepare_publish_environment_and_latest_are_mutually_exclusive(
@@ -382,38 +415,52 @@ def test_publish_to_environment_and_set_latest_version_flows_and_target_isolatio
 
     # Live approval cannot be consumed by publish_to_environment or set_latest_version.
     assert (
-        server.publish_to_environment(
-            "1", "100", "7", "11", live_prep["approval_id"], confirm=True
+        asyncio.run(
+            server.publish_to_environment(
+                "1", "100", "7", "11", live_prep["approval_id"], confirm=True
+            )
         )["ok"]
         is False
     )
     assert (
-        server.set_latest_version("1", "100", "11", live_prep["approval_id"], confirm=True)["ok"]
+        asyncio.run(
+            server.set_latest_version("1", "100", "11", live_prep["approval_id"], confirm=True)
+        )["ok"]
         is False
     )
     # Environment 7 approval cannot be consumed by environment 8, live, or latest.
     assert (
-        server.publish_to_environment(
-            "1", "100", "8", "11", env7_prep["approval_id"], confirm=True
+        asyncio.run(
+            server.publish_to_environment(
+                "1", "100", "8", "11", env7_prep["approval_id"], confirm=True
+            )
         )["ok"]
         is False
     )
     assert (
-        server.publish_version("1", "100", "11", env7_prep["approval_id"], confirm=True)["ok"]
+        asyncio.run(
+            server.publish_version("1", "100", "11", env7_prep["approval_id"], confirm=True)
+        )["ok"]
         is False
     )
     assert (
-        server.set_latest_version("1", "100", "11", env7_prep["approval_id"], confirm=True)["ok"]
+        asyncio.run(
+            server.set_latest_version("1", "100", "11", env7_prep["approval_id"], confirm=True)
+        )["ok"]
         is False
     )
     # Latest approval cannot be consumed by live or publish_to_environment.
     assert (
-        server.publish_version("1", "100", "11", latest_prep["approval_id"], confirm=True)["ok"]
+        asyncio.run(
+            server.publish_version("1", "100", "11", latest_prep["approval_id"], confirm=True)
+        )["ok"]
         is False
     )
     assert (
-        server.publish_to_environment(
-            "1", "100", "7", "11", latest_prep["approval_id"], confirm=True
+        asyncio.run(
+            server.publish_to_environment(
+                "1", "100", "7", "11", latest_prep["approval_id"], confirm=True
+            )
         )["ok"]
         is False
     )
@@ -423,16 +470,28 @@ def test_publish_to_environment_and_set_latest_version_flows_and_target_isolatio
 
     # Stale environment version check refuses without updating.
     writer.environments["7"]["containerVersionId"] = "99"
-    stale_env = server.publish_to_environment(
-        "1", "100", "7", "11", env7_prep["approval_id"], confirm=True
+    stale_env = asyncio.run(
+        server.publish_to_environment(
+            "1", "100", "7", "11", env7_prep["approval_id"], confirm=True
+        )
     )
     assert stale_env["ok"] is False
     assert writer.update_environment_calls == []
+    assert (
+        publish_guard.get_request(env7_prep["approval_id"], path=approval_file)["status"]
+        == "cancelled"
+    )
     writer.environments["7"]["containerVersionId"] = "10"
+    env7_prep = server.prepare_publish("1", "100", "11", environment_id="7")
+    publish_guard.approve_request(
+        env7_prep["approval_id"], typed_public_id="GTM-TEST123", path=approval_file
+    )
 
-    # Matching publish_to_environment succeeds, sends minimal fields + fingerprint, redacts auth.
-    env_res = server.publish_to_environment(
-        "1", "100", "7", "11", env7_prep["approval_id"], confirm=True
+    # Matching publish_to_environment succeeds, sends full resource (minus auth code) + fingerprint.
+    env_res = asyncio.run(
+        server.publish_to_environment(
+            "1", "100", "7", "11", env7_prep["approval_id"], confirm=True
+        )
     )
     assert env_res["ok"] is True
     assert env_res["result"]["authorizationCode"] == "[redacted]"
@@ -442,24 +501,29 @@ def test_publish_to_environment_and_set_latest_version_flows_and_target_isolatio
             "100",
             "7",
             {
+                "environmentId": "7",
+                "type": "user",
                 "name": "Staging",
                 "description": "QA env",
                 "enableDebug": True,
                 "url": "https://staging.example",
                 "containerVersionId": "11",
+                "fingerprint": "fp-env-7",
             },
             "fp-env-7",
         )
     ]
 
     # Matching set_latest_version succeeds once and cannot be replayed.
-    latest_res = server.set_latest_version(
-        "1", "100", "11", latest_prep["approval_id"], confirm=True
+    latest_res = asyncio.run(
+        server.set_latest_version("1", "100", "11", latest_prep["approval_id"], confirm=True)
     )
     assert latest_res == {"ok": True, "result": {"containerVersionId": "11"}}
     assert writer.set_latest_calls == [("1", "100", "11")]
     assert (
-        server.set_latest_version("1", "100", "11", latest_prep["approval_id"], confirm=True)["ok"]
+        asyncio.run(
+            server.set_latest_version("1", "100", "11", latest_prep["approval_id"], confirm=True)
+        )["ok"]
         is False
     )
 
@@ -489,10 +553,13 @@ def test_invariant_write_mode_cannot_change_served_versions(
     assert writer.create_environment_calls == []
     assert writer.update_environment_calls == []
 
-    # Metadata-only environment update still works in write mode.
+    # Metadata-only environment update preserves served containerVersionId and omits auth code.
     ok_update = server.update_environment("1", "100", "7", {"name": "Staging Renamed"})
     assert ok_update["name"] == "Staging Renamed"
-    assert all("containerVersionId" not in call[3] for call in writer.update_environment_calls)
+    assert len(writer.update_environment_calls) == 1
+    sent_body = writer.update_environment_calls[0][3]
+    assert sent_body["containerVersionId"] == "10"
+    assert "authorizationCode" not in sent_body
 
 
 @pytest.mark.parametrize(
@@ -545,7 +612,287 @@ def test_invariant_environment_allow_list_accepts_allowed_camel_case_keys(
     assert created["name"] == "x"
     assert updated["name"] == "x"
     assert writer.create_environment_calls == [("1", "100", allowed_body)]
-    assert writer.update_environment_calls == [("1", "100", "7", allowed_body, "fp-env-7")]
+    assert writer.update_environment_calls == [
+        (
+            "1",
+            "100",
+            "7",
+            {
+                "environmentId": "7",
+                "type": "user",
+                "containerVersionId": "10",
+                "fingerprint": "fp-env-7",
+                **allowed_body,
+            },
+            "fp-env-7",
+        )
+    ]
+
+
+def test_update_environment_preserves_served_version_and_workspace_and_omits_auth_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "write")
+    writer = FakePublishWriter()
+    writer.environments["12"] = {
+        "path": "accounts/1/containers/100/environments/12",
+        "accountId": "1",
+        "containerId": "100",
+        "environmentId": "12",
+        "type": "user",
+        "name": "Staging",
+        "description": "QA env",
+        "url": "https://staging.example",
+        "enableDebug": True,
+        "containerVersionId": "12",
+        "fingerprint": "fp-12",
+        "authorizationCode": "secret-12",
+        "authorizationTimestamp": "2026-01-01T00:00:00Z",
+        "tagManagerUrl": "https://tagmanager.google.com/#/env/12",
+    }
+    writer.environments["13"] = {
+        "path": "accounts/1/containers/100/environments/13",
+        "accountId": "1",
+        "containerId": "100",
+        "environmentId": "13",
+        "type": "user",
+        "name": "Workspace Preview",
+        "url": "https://preview.example",
+        "enableDebug": False,
+        "workspaceId": "3",
+        "fingerprint": "fp-ws-3",
+        "authorizationCode": "secret-ws-3",
+    }
+    writer.environments["14"] = {
+        "environmentId": "14",
+        "type": "user",
+        "name": "Empty",
+        "fingerprint": "fp-14",
+        "authorizationCode": "secret-14",
+    }
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    # 1. Environment serving containerVersionId "12" keeps it and uses current fingerprint.
+    res_ver = server.update_environment("1", "100", "12", {"name": "New"})
+    assert res_ver["name"] == "New"
+    assert res_ver["authorizationCode"] == "[redacted]"
+    _, _, env_id, sent_ver_body, sent_ver_fp = writer.update_environment_calls[-1]
+    assert env_id == "12"
+    assert sent_ver_fp == "fp-12"
+    assert sent_ver_body["containerVersionId"] == "12"
+    assert "workspaceId" not in sent_ver_body
+    assert sent_ver_body["name"] == "New"
+    assert sent_ver_body["type"] == "user"
+    assert sent_ver_body["description"] == "QA env"
+    assert sent_ver_body["url"] == "https://staging.example"
+    assert sent_ver_body["enableDebug"] is True
+    assert "authorizationCode" not in sent_ver_body
+
+    # 2. Environment linked to workspaceId "3" keeps it and uses current fingerprint.
+    res_ws = server.update_environment("1", "100", "13", {"name": "New"})
+    assert res_ws["name"] == "New"
+    assert res_ws["authorizationCode"] == "[redacted]"
+    _, _, env_id, sent_ws_body, sent_ws_fp = writer.update_environment_calls[-1]
+    assert env_id == "13"
+    assert sent_ws_fp == "fp-ws-3"
+    assert sent_ws_body["workspaceId"] == "3"
+    assert "containerVersionId" not in sent_ws_body
+    assert sent_ws_body["name"] == "New"
+    assert sent_ws_body["type"] == "user"
+    assert "authorizationCode" not in sent_ws_body
+
+    # 3. Environment with neither containerVersionId nor workspaceId keeps both absent.
+    server.update_environment("1", "100", "14", {"name": "Still Empty"})
+    _, _, _, sent_empty_body, sent_empty_fp = writer.update_environment_calls[-1]
+    assert sent_empty_fp == "fp-14"
+    assert "containerVersionId" not in sent_empty_body
+    assert "workspaceId" not in sent_empty_body
+    assert "authorizationCode" not in sent_empty_body
+
+    # 4. Caller-supplied fingerprint takes precedence over current resource fingerprint.
+    server.update_environment("1", "100", "12", {"name": "Renamed"}, fingerprint="fp-caller")
+    _, _, _, sent_fp_body, sent_caller_fp = writer.update_environment_calls[-1]
+    assert sent_caller_fp == "fp-caller"
+    assert sent_fp_body["containerVersionId"] == "12"
+    assert "authorizationCode" not in sent_fp_body
+
+
+def test_publish_to_environment_sends_full_current_resource_with_only_version_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "publish")
+    approval_file = tmp_path / "approvals.json"
+    monkeypatch.setenv("GTM_PUBLISH_APPROVAL_FILE", str(approval_file))
+
+    reader = FakePublishReader()
+    reader.versions_by_id["10"] = dict(reader.live_payload or {})
+    client = FakePublishClient()
+    writer = FakePublishWriter()
+    writer.environments["7"] = {
+        "path": "accounts/1/containers/100/environments/7",
+        "accountId": "1",
+        "containerId": "100",
+        "environmentId": "7",
+        "type": "user",
+        "name": "Staging",
+        "description": "QA env",
+        "url": "https://staging.example",
+        "enableDebug": True,
+        "containerVersionId": "10",
+        "fingerprint": "fp-env-7",
+        "authorizationCode": "secret-env-7",
+        "authorizationTimestamp": "2026-01-01T00:00:00Z",
+        "tagManagerUrl": "https://tagmanager.google.com/#/env/7",
+    }
+    monkeypatch.setattr(server, "get_reader", lambda: reader)
+    monkeypatch.setattr(server, "get_client", lambda: client)
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    prep = server.prepare_publish("1", "100", "11", environment_id="7")
+    publish_guard.approve_request(
+        prep["approval_id"], typed_public_id="GTM-TEST123", path=approval_file
+    )
+    res = asyncio.run(
+        server.publish_to_environment("1", "100", "7", "11", prep["approval_id"], confirm=True)
+    )
+    assert res["ok"] is True
+    assert res["result"]["authorizationCode"] == "[redacted]"
+    assert writer.update_environment_calls == [
+        (
+            "1",
+            "100",
+            "7",
+            {
+                "path": "accounts/1/containers/100/environments/7",
+                "accountId": "1",
+                "containerId": "100",
+                "environmentId": "7",
+                "type": "user",
+                "name": "Staging",
+                "description": "QA env",
+                "url": "https://staging.example",
+                "enableDebug": True,
+                "containerVersionId": "11",
+                "fingerprint": "fp-env-7",
+                "authorizationTimestamp": "2026-01-01T00:00:00Z",
+                "tagManagerUrl": "https://tagmanager.google.com/#/env/7",
+            },
+            "fp-env-7",
+        )
+    ]
+    assert "authorizationCode" not in writer.update_environment_calls[0][3]
+
+
+@pytest.mark.parametrize("env_type", ["live", "latest", "workspace", "other"])
+def test_non_user_environments_are_refused_for_update_publish_prepare_and_delete(
+    env_type: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "publish")
+    approval_file = tmp_path / "approvals.json"
+    monkeypatch.setenv("GTM_PUBLISH_APPROVAL_FILE", str(approval_file))
+
+    reader = FakePublishReader()
+    reader.versions_by_id["10"] = dict(reader.live_payload or {})
+    client = FakePublishClient()
+    writer = FakePublishWriter()
+    writer.environments["20"] = {
+        "environmentId": "20",
+        "type": env_type,
+        "name": "Managed Env",
+        "containerVersionId": "10",
+        "fingerprint": "fp-20",
+        "authorizationCode": "secret-20",
+    }
+
+    monkeypatch.setattr(server, "get_reader", lambda: reader)
+    monkeypatch.setattr(server, "get_client", lambda: client)
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    expected_msg = (
+        f"Environment 20 is of type '{env_type}'; "
+        "only user-created environments can be changed here."
+    )
+
+    update_res = server.update_environment("1", "100", "20", {"name": "Renamed"})
+    assert update_res == {"ok": False, "message": expected_msg}
+
+    prep_res = server.prepare_publish("1", "100", "11", environment_id="20")
+    assert prep_res == {"ok": False, "message": expected_msg}
+    assert publish_guard.list_requests(include_closed=True, path=approval_file) == []
+
+    publish_res = asyncio.run(
+        server.publish_to_environment("1", "100", "20", "11", "some-approval-id", confirm=True)
+    )
+    assert publish_res == {"ok": False, "message": expected_msg}
+
+    delete_res = server.delete_environment("1", "100", "20", confirm=True)
+    assert delete_res == {"ok": False, "message": expected_msg}
+
+    assert writer.update_environment_calls == []
+    assert writer.delete_environment_calls == []
+
+
+@pytest.mark.parametrize("env_type", ["absent", None, "", "user"])
+def test_user_and_untyped_environments_are_allowed_for_update_publish_prepare_and_delete(
+    env_type: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "publish")
+    approval_file = tmp_path / "approvals.json"
+    monkeypatch.setenv("GTM_PUBLISH_APPROVAL_FILE", str(approval_file))
+
+    reader = FakePublishReader()
+    reader.versions_by_id["10"] = dict(reader.live_payload or {})
+    client = FakePublishClient()
+    writer = FakePublishWriter()
+    env_payload: dict[str, Any] = {
+        "environmentId": "20",
+        "name": "User Env",
+        "containerVersionId": "10",
+        "fingerprint": "fp-20",
+        "authorizationCode": "secret-20",
+    }
+    if env_type != "absent":
+        env_payload["type"] = env_type
+    writer.environments["20"] = env_payload
+
+    monkeypatch.setattr(server, "get_reader", lambda: reader)
+    monkeypatch.setattr(server, "get_client", lambda: client)
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    update_res = server.update_environment("1", "100", "20", {"name": "Renamed"})
+    assert update_res["name"] == "Renamed"
+
+    prep_res = server.prepare_publish("1", "100", "11", environment_id="20")
+    assert "approval_id" in prep_res
+    publish_guard.approve_request(
+        prep_res["approval_id"], typed_public_id="GTM-TEST123", path=approval_file
+    )
+
+    publish_res = asyncio.run(
+        server.publish_to_environment(
+            "1", "100", "20", "11", prep_res["approval_id"], confirm=True
+        )
+    )
+    assert publish_res["ok"] is True
+
+    delete_res = server.delete_environment("1", "100", "20", confirm=True)
+    assert delete_res == {"ok": True, "result": {"deleted": "20"}}
+
+
+def test_user_environment_delete_succeeds_with_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GTM_ACCESS_MODE", "write")
+    writer = FakePublishWriter()
+    monkeypatch.setattr(server, "get_writer", lambda: writer)
+
+    res = server.delete_environment("1", "100", "7", confirm=True)
+    assert res == {"ok": True, "result": {"deleted": "7"}}
+    assert writer.delete_environment_calls == [("1", "100", "7")]
 
 
 def test_invariant_reauthorize_environment_has_no_body_param_and_sends_no_version_or_workspace(

@@ -5,6 +5,7 @@ from typing import Any
 
 import googleapiclient
 import pytest
+from google.auth.credentials import AnonymousCredentials
 from googleapiclient.discovery import build_from_document
 from googleapiclient.errors import HttpError
 from httplib2 import Response
@@ -280,7 +281,10 @@ def test_client_methods_exact_paths_and_parents_match_discovery_doc(tmp_path: Pa
         / "documents"
         / "tagmanager.v2.json"
     )
-    discovery_service = build_from_document(doc_path.read_text(encoding="utf-8"))
+    discovery_service = build_from_document(
+        doc_path.read_text(encoding="utf-8"),
+        credentials=AnonymousCredentials(),
+    )
     built_uris: list[tuple[str, str]] = []
 
     class _DiscoveryValidatingClient(GTMClient):

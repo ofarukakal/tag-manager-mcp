@@ -44,11 +44,12 @@ SENSITIVE_KEYS = {
 _SENSITIVE_KEY_ALT = "|".join(
     re.escape(key) for key in sorted(SENSITIVE_KEYS, key=len, reverse=True)
 )
+_MAX_SANITIZE_TEXT_BYTES = 1024 * 1024
 _SENSITIVE_TEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Escaped double quotes, e.g. \"authorizationCode\": \"SECRET\"
     re.compile(
         rf'(\\"(?:{_SENSITIVE_KEY_ALT})\\"\s*:\s*\\")'
-        r'(?:[^"\\]|\\\\\\"|\\\\|\\[^"])*'
+        r'(?:[^"\\]|\\(?:[^"\\]|\\(?:[^"\\]|\\(?:[^"\\]|"|\\))))*'
         r'(\\")',
         re.IGNORECASE,
     ),
@@ -62,7 +63,7 @@ _SENSITIVE_TEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Escaped single quotes, e.g. \'refresh_token\': \'SECRET\'
     re.compile(
         rf"(\\'(?:{_SENSITIVE_KEY_ALT})\\'\s*:\s*\\')"
-        r"(?:[^'\\]|\\\\\\'|\\\\|\\[^'])*"
+        r"(?:[^'\\]|\\(?:[^'\\]|\\(?:[^'\\]|\\(?:[^'\\]|'|\\))))*"
         r"(\\')",
         re.IGNORECASE,
     ),
@@ -261,6 +262,9 @@ def get_debug_logger() -> DebugCallLogger:
 
 
 def _sanitize_text(text: str) -> str:
+    encoded_len = len(text.encode("utf-8"))
+    if encoded_len > _MAX_SANITIZE_TEXT_BYTES:
+        return f"[TRUNCATED {encoded_len} bytes]"
     result = text
     for pattern in _SENSITIVE_TEXT_PATTERNS:
         result = pattern.sub(r"\1[REDACTED]\2", result)

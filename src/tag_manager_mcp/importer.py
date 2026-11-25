@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import heapq
+import json
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -339,6 +340,7 @@ def plan_import(
         if isinstance(item, dict) and item.get("type")
     }
     enable_builtins = sorted(needed_builtin_types - existing_builtin_types)
+    extra_warnings: list[str] = []
 
     for kind in PLAN_KINDS:
         id_field = ENTITY_ID_FIELDS[kind]
@@ -372,6 +374,8 @@ def plan_import(
                 )
                 used_names.add(chosen_name)
                 create[kind].append({"name": chosen_name, "source_id": source_id})
+                _check_renamed_template_warning(kind, item, name, chosen_name, extra_warnings)
+                _check_gallery_template_warning(kind, item, chosen_name, extra_warnings)
                 continue
 
             raw_target_id = existing_match.get(id_field)
@@ -385,10 +389,13 @@ def plan_import(
                 update[kind].append(
                     {"name": name, "source_id": source_id, "target_id": target_id}
                 )
+                _check_gallery_template_warning(kind, item, name, extra_warnings)
             else:
                 new_name = _unique_import_name(name, used_names)
                 used_names.add(new_name)
                 create[kind].append({"name": new_name, "source_id": source_id})
+                _check_renamed_template_warning(kind, item, name, new_name, extra_warnings)
+                _check_gallery_template_warning(kind, item, new_name, extra_warnings)
 
         if mode == "overwrite":
             for item in existing_items:
@@ -404,6 +411,7 @@ def plan_import(
         create[kind].sort(key=_plan_entry_sort_key)
         update[kind].sort(key=_plan_entry_sort_key)
         delete[kind].sort(key=_plan_entry_sort_key)
+        delete[kind] = _order_deletes(kind, delete[kind], existing_items)
         skip[kind].sort(key=_plan_entry_sort_key)
 
     return {
@@ -412,7 +420,7 @@ def plan_import(
         "delete": delete,
         "skip": skip,
         "enable_builtins": enable_builtins,
-        "warnings": _collect_warnings(version),
+        "warnings": [*_collect_warnings(version), *extra_warnings],
     }
 
 
@@ -493,6 +501,152 @@ def _order_entries_topologically(
     return ordered
 
 
+def _update_template_data_display_name(template_data: Any, new_name: str) -> str | None:
+    """Update displayName in templateData's ___INFO___ JSON block, or return None if invalid."""
+    if not isinstance(template_data, str):
+        return None
+    lines = template_data.splitlines(keepends=True)
+    info_line_idx: int | None = None
+    offset = 0
+    block_start = 0
+    block_end = len(template_data)
+    for idx, line in enumerate(lines):
+        if info_line_idx is None:
+            if line.rstrip("\r\n") == "___INFO___":
+                info_line_idx = idx
+                block_start = offset + len(line)
+        elif line.startswith("___"):
+            block_end = offset
+            break
+        offset += len(line)
+
+    if info_line_idx is None:
+        return None
+
+    section = template_data[block_start:block_end]
+    if not section.strip():
+        return None
+    lead_ws = len(section) - len(section.lstrip())
+    trail_ws = len(section) - len(section.rstrip())
+    json_start = block_start + lead_ws
+    json_end = block_end - trail_ws
+
+    try:
+        info = json.loads(template_data[json_start:json_end])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(info, dict):
+        return None
+
+    info["displayName"] = new_name
+    serialized = json.dumps(info, indent=2, ensure_ascii=False)
+    return template_data[:json_start] + serialized + template_data[json_end:]
+
+
+def _check_renamed_template_warning(
+    kind: str,
+    item: dict[str, Any],
+    orig_name: str,
+    planned_name: str,
+    warnings: list[str],
+) -> None:
+    if (
+        kind == "customTemplate"
+        and planned_name != orig_name
+        and _update_template_data_display_name(item.get("templateData"), planned_name) is None
+    ):
+        warnings.append(
+            f"customTemplate '{planned_name}' templateData has no parsable "
+            "___INFO___ JSON block; displayName could not be updated."
+        )
+
+
+def _check_gallery_template_warning(
+    kind: str,
+    item: dict[str, Any],
+    planned_name: str,
+    warnings: list[str],
+) -> None:
+    if kind == "customTemplate" and "galleryReference" in item:
+        warnings.append(
+            f"customTemplate '{planned_name}': gallery link is not preserved; "
+            "imported as a local copy."
+        )
+
+
+def _tag_referenced_names(item: dict[str, Any]) -> list[str]:
+    """Return tag names referenced via setupTag, teardownTag, or tagReference parameters."""
+    refs: list[str] = []
+    for field in ("setupTag", "teardownTag"):
+        for ref in item.get(field) or []:
+            if isinstance(ref, dict) and ref.get("tagName"):
+                refs.append(str(ref["tagName"]))
+    for ref in _iter_entity_tag_refs("tag", item):
+        if ref.get("value"):
+            refs.append(str(ref["value"]))
+    return refs
+
+
+def _order_deletes(
+    kind: str, entries: list[dict[str, Any]], existing_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Order delete entries so referrers are deleted before the entities they reference."""
+    if len(entries) <= 1 or kind not in ("trigger", "tag"):
+        return list(entries)
+
+    id_field = ENTITY_ID_FIELDS[kind]
+    by_id: dict[str, dict[str, Any]] = {}
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in existing_items:
+        raw_id = item.get(id_field)
+        if raw_id is not None:
+            by_id[str(raw_id)] = item
+        name = str(item.get("name") or "")
+        if name and name not in by_name:
+            by_name[name] = item
+
+    def _find_existing(entry: dict[str, Any]) -> dict[str, Any]:
+        target_id = entry.get("target_id")
+        if target_id is not None and str(target_id) in by_id:
+            return by_id[str(target_id)]
+        return by_name.get(str(entry.get("name") or ""), {})
+
+    if kind == "trigger":
+
+        def _key(entry: dict[str, Any]) -> str | None:
+            tid = entry.get("target_id")
+            return str(tid) if tid is not None else None
+
+        def _refs(item: dict[str, Any]) -> list[str]:
+            return [
+                str(ref["value"])
+                for ref in _iter_entity_trigger_refs("trigger", item)
+                if ref.get("value") is not None
+            ]
+
+    else:
+
+        def _key(entry: dict[str, Any]) -> str | None:
+            return str(entry.get("name") or "") or None
+
+        def _refs(item: dict[str, Any]) -> list[str]:
+            return _tag_referenced_names(item)
+
+    prereqs: dict[str, list[str]] = {}
+    for entry in entries:
+        referrer_key = _key(entry)
+        if referrer_key is None:
+            continue
+        for target_key in _refs(_find_existing(entry)):
+            prereqs.setdefault(target_key, []).append(referrer_key)
+
+    return _order_entries_topologically(
+        entries,
+        key_of=_key,
+        deps_of=lambda e: prereqs.get(_key(e) or "", []),
+    )
+
+
 def _order_creates(
     kind: str, entries: list[dict[str, Any]], source: _EntitySource
 ) -> list[dict[str, Any]]:
@@ -510,13 +664,7 @@ def _order_creates(
     if kind == "tag":
 
         def _tag_deps(entry: dict[str, Any]) -> list[str]:
-            item = _find_source_item(entry, "tag", source) or {}
-            deps: list[str] = []
-            for field in ("setupTag", "teardownTag"):
-                for ref in item.get(field) or []:
-                    if isinstance(ref, dict) and ref.get("tagName"):
-                        deps.append(str(ref["tagName"]))
-            return deps
+            return _tag_referenced_names(_find_source_item(entry, "tag", source) or {})
 
         def _tag_orig_name(entry: dict[str, Any]) -> str | None:
             item = _find_source_item(entry, "tag", source)
@@ -556,13 +704,16 @@ def _iter_param_trigger_refs(param: Any) -> Iterator[dict[str, Any]]:
     """Yield Parameter dicts that hold a trigger ID reference."""
     if not isinstance(param, dict):
         return
-    if param.get("type") == "triggerReference" and param.get("value") is not None:
+    if (
+        param.get("type") in ("triggerReference", "TRIGGER_REFERENCE")
+        and param.get("value") is not None
+    ):
         yield param
     if param.get("key") == "triggerIds" and isinstance(param.get("list"), list):
         for item in param["list"]:
             if (
                 isinstance(item, dict)
-                and item.get("type") in (None, "triggerReference")
+                and item.get("type") in (None, "triggerReference", "TRIGGER_REFERENCE")
                 and item.get("value") is not None
             ):
                 yield item
@@ -632,7 +783,10 @@ def _iter_param_tag_refs(param: Any) -> Iterator[dict[str, Any]]:
     """Yield Parameter dicts that hold a tag name reference."""
     if not isinstance(param, dict):
         return
-    if param.get("type") == "tagReference" and param.get("value") is not None:
+    if (
+        param.get("type") in ("tagReference", "TAG_REFERENCE")
+        and param.get("value") is not None
+    ):
         yield param
     for nested_key in ("list", "map"):
         nested = param.get(nested_key)
@@ -712,6 +866,8 @@ def _prepare_body(
         body.pop(field, None)
     body.pop(id_field, None)
     body["name"] = planned_name
+    if kind == "customTemplate":
+        body.pop("galleryReference", None)
 
     if kind in ("customTemplate", "variable", "trigger", "tag"):
         parent_folder_id = body.get("parentFolderId")
@@ -849,6 +1005,29 @@ def apply_import(
                     id_map,
                     tag_name_map,
                 )
+                if kind == "customTemplate":
+                    source_item = _find_source_item(entry, kind, source)
+                    orig_name = (
+                        str(source_item.get("name") or "") if source_item else planned_name
+                    )
+                    if planned_name != orig_name:
+                        updated_tpl = _update_template_data_display_name(
+                            body.get("templateData"), planned_name
+                        )
+                        if updated_tpl is not None:
+                            body["templateData"] = updated_tpl
+                        else:
+                            errors.append(
+                                {
+                                    "kind": kind,
+                                    "name": planned_name,
+                                    "error": (
+                                        f"customTemplate '{planned_name}' templateData has no "
+                                        "parsable ___INFO___ JSON block; displayName could not "
+                                        "be updated."
+                                    ),
+                                }
+                            )
                 response = ops.create(ops_kind, body)
                 new_id = str((response or {}).get(id_field) or "")
                 if source_id is not None and new_id:

@@ -35,7 +35,7 @@ defaults to `read`; any unrecognized value fails closed at startup.
 |---|---|---|
 | `read` (default) | Discovery, diagnostics, version headers/summaries/entities/diffs/exports, workspace/folder/entity/environment/destination/snippet/account reads, inventory, import planning | `https://www.googleapis.com/auth/tagmanager.readonly` |
 | `write` | All `read` tools plus workspace creation/update/sync/conflict-resolution/quick-preview/bulk-update, entity CRUD and revert (all workspace entity kinds), built-in variables, gallery template import, folder moves, version metadata/delete/undelete, environment metadata create/update/delete (without `containerVersionId`), destination linking, import apply | `https://www.googleapis.com/auth/tagmanager.readonly`, `https://www.googleapis.com/auth/tagmanager.edit.containers`, `https://www.googleapis.com/auth/tagmanager.edit.containerversions` |
-| `publish` | All `read` and `write` tools plus `prepare_publish`, `publish_version`, `publish_to_environment`, `set_latest_version` (all require terminal approval + `confirm=true`), `list_publish_requests`, and `reauthorize_environment` | `https://www.googleapis.com/auth/tagmanager.readonly`, `https://www.googleapis.com/auth/tagmanager.edit.containers`, `https://www.googleapis.com/auth/tagmanager.edit.containerversions`, `https://www.googleapis.com/auth/tagmanager.publish` |
+| `publish` | All `read` and `write` tools plus `prepare_publish`, `publish_version`, `publish_to_environment`, `set_latest_version` (all require two in-client elicitation approvals or terminal approval + `confirm=true`), `list_publish_requests`, and `reauthorize_environment` | `https://www.googleapis.com/auth/tagmanager.readonly`, `https://www.googleapis.com/auth/tagmanager.edit.containers`, `https://www.googleapis.com/auth/tagmanager.edit.containerversions`, `https://www.googleapis.com/auth/tagmanager.publish` |
 | `admin` | All `read`, `write`, and `publish` tools plus `delete_workspace`, container creation/update/deletion/combine/move-tag-id, `update_account`, and user-permission management (`list`/`get`/`create`/`update`/`delete`) | `https://www.googleapis.com/auth/tagmanager.readonly`, `https://www.googleapis.com/auth/tagmanager.edit.containers`, `https://www.googleapis.com/auth/tagmanager.edit.containerversions`, `https://www.googleapis.com/auth/tagmanager.publish`, `https://www.googleapis.com/auth/tagmanager.delete.containers`, `https://www.googleapis.com/auth/tagmanager.manage.accounts`, `https://www.googleapis.com/auth/tagmanager.manage.users` |
 
 Note: `delete_workspace` is gated at `admin` because Google's Tag Manager API v2 discovery document
@@ -52,7 +52,7 @@ then restart your MCP client.
 
 Changing which container version **any** GTM environment serves — the live environment, a
 user-created environment, or the `latest` environment — requires `GTM_ACCESS_MODE=publish`
-(or `admin`) **and** a two-step out-of-band human approval workflow:
+(or `admin`) **and** two separate human confirmations inside your MCP client via MCP elicitation:
 
 1. **Prepare via MCP**: The MCP client calls
    `prepare_publish(account_id, container_id, version_id, environment_id=None, latest=False)`.
@@ -64,48 +64,58 @@ user-created environment, or the `latest` environment — requires `GTM_ACCESS_M
    The server writes a **pending** request to `~/.config/gtm-mcp/publish-approvals.json`
    (override with `GTM_PUBLISH_APPROVAL_FILE`) and returns an `approval_id`, target, diff summary,
    expiry timestamp, and instructions.
-2. **Approve out-of-band in a terminal**: A human runs `.venv/bin/tag-manager-approve <approval_id>`
-   in an interactive TTY (or `.venv/bin/tag-manager-approve` with no arguments to list pending
-   requests). The CLI sanitizes all displayed values against terminal escape sequences, shows the
-   target (`LIVE`, `Environment <id> (<name>)`, or `LATEST`), container, version, current version
-   being replaced, and diff summary, then asks the human to type the exact container public ID
-   (e.g., `GTM-W525XW4`). No MCP tool can approve a request.
-3. **Publish via MCP**: The MCP client calls the matching publish tool with `approval_id` and
-   `confirm=true`:
+2. **Confirm twice in your MCP client and publish**: The MCP client calls the matching publish tool
+   with `approval_id` and `confirm=true`:
    - `publish_version(account_id, container_id, version_id, approval_id, confirm=true)` for `live`
    - `publish_to_environment(account_id, container_id, environment_id, version_id, approval_id, confirm=true)` for a user environment
    - `set_latest_version(account_id, container_id, version_id, approval_id, confirm=true)` for `latest`
-   The server re-fetches the target's currently served version from the GTM API, atomically
-   validates and consumes the approval for that exact target, and only then performs the publish.
+   The server verifies the request is pending, unexpired, and matches the target, checks that the
+   connected MCP client declared elicitation support (failing closed if not), and sends two
+   separate elicitation prompts:
+   - **Typed approval**: Shows the target (`LIVE`, `Environment <id> (<name>)`, or `LATEST`),
+     container public ID and name, version ID and name, current version being replaced, and a
+     sanitized diff summary (control characters escaped, long values truncated), and asks the human
+     to type the exact container public ID (e.g. `GTM-W525XW4`).
+   - **Click approval**: Shows a short final confirmation (`Publish <public_id> v<version> to
+     <target> now?`) with a `publish` boolean defaulting to `false` that must be accepted as `true`.
+   Any decline, cancel, mismatch, `publish=false`, or elicitation error publishes nothing and marks
+   the request `cancelled` (a new `prepare_publish` is required). After both prompts succeed, the
+   server records the approval, re-reads the target's currently served version from the GTM API,
+   atomically consumes the single-use approval, and only then performs the publish.
+3. **Terminal fallback for clients without elicitation**: The interactive terminal CLI
+   `.venv/bin/tag-manager-approve <approval_id>` remains available as an alternative for MCP
+   clients that do not support elicitation. A request approved in the terminal is accepted by the
+   publish tools without prompting again **only if it was approved via the terminal**.
 
 Safety properties of publish approvals:
 
-- **10-minute expiry**: Approval requests expire after 600 seconds.
+- **10-minute expiry**: Approval requests expire after 600 seconds; expired requests are refused
+  before any prompt is shown.
 - **Single use and target binding**: Once consumed, the request is marked `used` and cannot be
   replayed. An approval prepared for one target (`live`, `latest`, or `environment:<id>`) cannot be
   consumed by another target. Creating a new request for the same account, container, and target
   cancels any prior open request for that target.
+- **No tool-argument bypass**: Neither the typed container ID nor the click confirmation can be
+  supplied as MCP tool arguments.
 - **Current-version binding**: If the target's currently served version changes between
-  `prepare_publish` and the publish call, the approval is invalidated and publishing is refused.
+  `prepare_publish` and the publish call (including while the prompts are open), the approval is
+  invalidated and publishing is refused.
 - **Environment safeguards**: `create_environment` and `update_environment` accept only the exact
   camelCase metadata keys `name`, `description`, `url`, and `enableDebug` (all other keys,
   including `containerVersionId`, `container_version_id`, `workspaceId`, and `workspace_id`, are
   rejected). The only code path that may send `containerVersionId` for an environment is
-  `publish_to_environment` after a successful `tag-manager-approve` approval; there is no path
-  that sends `workspaceId` for an environment. `reauthorize_environment` takes only `account_id`,
-  `container_id`, and `environment_id` (no caller-supplied body). `list_environments` and
-  `get_environment` redact `authorizationCode` (only `reauthorize_environment` returns the newly
-  rotated code, and the debug log redacts it even inside JSON-encoded tool results).
+  `publish_to_environment` after approval is consumed; there is no path that sends `workspaceId`
+  for an environment. `reauthorize_environment` takes only `account_id`, `container_id`, and
+  `environment_id` (no caller-supplied body). `list_environments` and `get_environment` redact
+  `authorizationCode` (only `reauthorize_environment` returns the newly rotated code, and the debug
+  log redacts it even inside JSON-encoded tool results).
 - **Read-only inspection**: `list_publish_requests` lists open (`pending`/`approved`) requests
   without allowing state changes.
 
 ### Limitations
 
-The terminal approval (`tag-manager-approve`) protects against an MCP client that can only invoke
-MCP tools (for example, a chat client without shell access). An agent that can execute arbitrary
-shell commands as the same OS user could bypass any local approval mechanism (for example by
-editing the approval file or driving a PTY), so run agents with shell access in `read` or `write`
-mode instead of `publish` or `admin`.
+The approval prompts are shown by the MCP client; a client that auto-answers elicitations could
+approve on its own, so use a client that shows them to you (Claude Code, Claude Desktop).
 
 ## Import a container export
 
@@ -326,9 +336,9 @@ Configure it with `GTM_DEBUG_LOG_ENABLED`, `GTM_DEBUG_DB_PATH`, `GTM_DEBUG_RETEN
 | Tool | Purpose |
 |---|---|
 | `prepare_publish` | Create a pending publish approval request with a diff summary against `live`, `environment_id`, or `latest` |
-| `publish_version` | Publish a container version live after `tag-manager-approve` approval; requires `approval_id` and `confirm=true` |
-| `publish_to_environment` | Point a user environment at a container version after `tag-manager-approve` approval; requires `approval_id` and `confirm=true` |
-| `set_latest_version` | Set a container version as the latest version after `tag-manager-approve` approval; requires `approval_id` and `confirm=true` |
+| `publish_version` | Publish a container version live after two-step in-client elicitation approval (or `tag-manager-approve` terminal fallback); requires `approval_id` and `confirm=true` |
+| `publish_to_environment` | Point a user environment at a container version after two-step in-client elicitation approval (or `tag-manager-approve` terminal fallback); requires `approval_id` and `confirm=true` |
+| `set_latest_version` | Set a container version as the latest version after two-step in-client elicitation approval (or `tag-manager-approve` terminal fallback); requires `approval_id` and `confirm=true` |
 | `list_publish_requests` | List open (`pending` and `approved`) publish requests without modifying state |
 | `reauthorize_environment` | Re-generate and return the authorization code for an environment |
 

@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import time
+from collections.abc import Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
 from googleapiclient.errors import HttpError
+from pydantic import BaseModel, Field
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp import Context, FastMCP
 except ModuleNotFoundError:  # mcp 2.x renamed FastMCP to MCPServer
+    from mcp.server.mcpserver import Context
     from mcp.server.mcpserver import MCPServer as FastMCP
 
 from . import publish_guard
@@ -83,9 +88,10 @@ workspace-scoped operation; never assume workspace ID 1. Prefer get_version_summ
 get_version_entities over exporting when answering questions about a container version. Use
 export_container_to_file only when you need the full GTM export JSON written to disk for other
 tools to read. To publish a container version (to live, a user environment, or latest), call
-prepare_publish first, wait for a human to run tag-manager-approve in a terminal, and then call
-publish_version, publish_to_environment, or set_latest_version with the approval_id and
-confirm=true.
+prepare_publish first, then call publish_version, publish_to_environment, or set_latest_version
+with the approval_id and confirm=true; your MCP client will ask the human to type the container
+public ID and then click to confirm (or a human may pre-approve via tag-manager-approve in a
+terminal for clients without elicitation).
 """
 
 tool_registry = ToolRegistry()
@@ -303,6 +309,31 @@ def _redact_environment(env: dict[str, Any]) -> dict[str, Any]:
     return env
 
 
+def _build_environment_update_body(
+    current_env: dict[str, Any], updates: dict[str, Any]
+) -> dict[str, Any]:
+    update_body = {
+        key: value for key, value in current_env.items() if key != "authorizationCode"
+    }
+    update_body.update(updates)
+    update_body.pop("authorizationCode", None)
+    return update_body
+
+
+def _require_user_environment(environment_id: str, env: dict[str, Any]) -> dict[str, Any] | None:
+    env_type = env.get("type") if isinstance(env, dict) else None
+    if env_type in (None, "", "user"):
+        return None
+    type_label = str(env_type) if env_type else "unknown"
+    return {
+        "ok": False,
+        "message": (
+            f"Environment {environment_id} is of type '{type_label}'; "
+            "only user-created environments can be changed here."
+        ),
+    }
+
+
 def _http_status(exc: BaseException | None) -> int | None:
     if exc is None:
         return None
@@ -395,6 +426,352 @@ def _summarize_publish_diff(
             "changed_count": len(changed),
         }
     return summary
+
+
+_ELICIT_MAX_DISPLAY_LENGTH = 120
+
+
+class _TypedPublishConfirmation(BaseModel):
+    container_id: str = Field(
+        description="Type the exact container public ID (e.g. GTM-ABC123) to continue."
+    )
+
+
+class _ClickPublishConfirmation(BaseModel):
+    publish: bool = Field(
+        default=False,
+        description="Set to true to confirm publishing now.",
+    )
+
+
+def _sanitize_display(value: Any, *, max_length: int = _ELICIT_MAX_DISPLAY_LENGTH) -> str:
+    """Escape non-printable characters and truncate long display values safely."""
+    text = str(value)
+    parts: list[str] = []
+    for ch in text:
+        if ch.isprintable():
+            parts.append(ch)
+        else:
+            code = ord(ch)
+            if code <= 0xFF:
+                parts.append(f"\\x{code:02x}")
+            elif code <= 0xFFFF:
+                parts.append(f"\\u{code:04x}")
+            else:
+                parts.append(f"\\U{code:08x}")
+    escaped = "".join(parts)
+    if len(escaped) > max_length:
+        if max_length <= 3:
+            return escaped[:max_length]
+        return escaped[: max_length - 3] + "..."
+    return escaped
+
+
+def _format_publish_target(record: Mapping[str, Any]) -> str:
+    target = record.get("target") if "target" in record else publish_guard.TARGET_LIVE
+    if target == publish_guard.TARGET_LIVE:
+        return "LIVE"
+    if target == publish_guard.TARGET_LATEST:
+        return "LATEST"
+    if isinstance(target, str) and target.startswith(publish_guard.TARGET_ENVIRONMENT_PREFIX):
+        env_id = _sanitize_display(target[len(publish_guard.TARGET_ENVIRONMENT_PREFIX) :])
+        target_name = record.get("target_name")
+        if target_name:
+            return f"Environment {env_id} ({_sanitize_display(target_name)})"
+        return f"Environment {env_id}"
+    return _sanitize_display(target)
+
+
+def _format_diff_summary_lines(diff_summary: dict[str, Any]) -> list[str]:
+    """Render a compact sanitized human-readable view of the diff summary."""
+    if not diff_summary:
+        return ["  (no changes reported)"]
+
+    lines: list[str] = []
+    for key, value in diff_summary.items():
+        safe_key = _sanitize_display(key)
+        if isinstance(value, dict):
+            non_empty_parts: list[str] = []
+            for action in ("added", "removed", "changed"):
+                items = value.get(action)
+                if isinstance(items, list) and items:
+                    names = [
+                        _sanitize_display(
+                            entry.get("name") or entry.get("id") or entry
+                            if isinstance(entry, dict)
+                            else entry
+                        )
+                        for entry in items
+                    ]
+                    non_empty_parts.append(f"{action} ({len(items)}): {', '.join(names)}")
+                elif isinstance(items, int) and items > 0:
+                    non_empty_parts.append(f"{action}: {items}")
+            if non_empty_parts:
+                lines.append(f"  {safe_key}: " + "; ".join(non_empty_parts))
+            elif not any(k in value for k in ("added", "removed", "changed")):
+                lines.append(
+                    f"  {safe_key}: {_sanitize_display(json.dumps(value, sort_keys=True))}"
+                )
+        elif isinstance(value, list):
+            if value:
+                rendered = ", ".join(_sanitize_display(item) for item in value)
+                lines.append(f"  {safe_key} ({len(value)}): {rendered}")
+            else:
+                lines.append(f"  {safe_key}: 0")
+        else:
+            lines.append(f"  {safe_key}: {_sanitize_display(value)}")
+    return lines or ["  (no entity changes)"]
+
+
+def _format_elicit_typed_message(record: Mapping[str, Any]) -> str:
+    target_label = _format_publish_target(record)
+    public_id = _sanitize_display(record["public_id"])
+    container_name = record.get("container_name")
+    container_label = (
+        f"{public_id} ({_sanitize_display(container_name)})" if container_name else public_id
+    )
+    version_id = _sanitize_display(record["version_id"])
+    version_name = (
+        _sanitize_display(record["version_name"]) if record.get("version_name") else "(unnamed)"
+    )
+    live_version = record.get("live_version_id")
+    replaces_label = f"v{_sanitize_display(live_version)}" if live_version else "(none)"
+    target = record.get("target") if "target" in record else publish_guard.TARGET_LIVE
+    replaces_heading = (
+        "Replaces live:" if target == publish_guard.TARGET_LIVE else "Replaces current:"
+    )
+    diff_lines = _format_diff_summary_lines(record.get("diff_summary") or {})
+    lines = [
+        f"Publishes to: {target_label}",
+        f"Container: {container_label}",
+        f"Version: v{version_id} - {version_name}",
+        f"{replaces_heading} {replaces_label}",
+        "Diff summary:",
+        *diff_lines,
+        f"Type the container public ID ({public_id}) to confirm.",
+    ]
+    return "\n".join(lines)
+
+
+def _format_elicit_click_message(record: Mapping[str, Any]) -> str:
+    public_id = _sanitize_display(record["public_id"])
+    version_id = _sanitize_display(record["version_id"])
+    target_label = _format_publish_target(record)
+    return f"Publish {public_id} v{version_id} to {target_label} now?"
+
+
+def _client_supports_elicitation(ctx: Context | None) -> bool:
+    """Return True only when ``ctx`` belongs to a client declaring form elicitation support."""
+    if ctx is None or not callable(getattr(ctx, "elicit", None)):
+        return False
+    try:
+        capabilities = ctx.client_capabilities
+    except Exception:
+        return False
+    if capabilities is None:
+        return False
+    elicitation = getattr(capabilities, "elicitation", None)
+    if elicitation is None:
+        return False
+    if isinstance(elicitation, bool):
+        return elicitation
+    # Bare `elicitation: {}` (form=None, url=None) counts as form support; url-only does not.
+    return (
+        getattr(elicitation, "form", None) is not None
+        or getattr(elicitation, "url", None) is None
+    )
+
+
+def _cancel_request_best_effort(approval_id: str, *, reason: str | None = None) -> None:
+    with suppress(publish_guard.PublishApprovalError):
+        publish_guard.cancel_request(approval_id, reason=reason)
+
+
+async def _ensure_publish_approved(
+    approval_id: str,
+    *,
+    account_id: str,
+    container_id: str,
+    version_id: str,
+    target: str,
+    ctx: Context | None,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Ensure a publish request is approved via terminal fallback or two-step elicitation.
+
+    Returns ``(ran_elicitation, error_response)``. When ``error_response`` is None,
+    the caller must re-read the currently served version and call
+    ``publish_guard.consume_approval(...)`` before invoking the GTM API.
+    """
+    clean_id = approval_id.strip()
+    try:
+        record = publish_guard.get_request(clean_id)
+    except publish_guard.PublishApprovalError as exc:
+        return False, {"ok": False, "message": str(exc)}
+
+    if record is None:
+        return False, {"ok": False, "message": f"Unknown publish approval request: {clean_id!r}"}
+
+    status = record["status"]
+    if status == publish_guard.STATUS_USED:
+        return False, {
+            "ok": False,
+            "message": f"Publish approval request {clean_id!r} has already been used.",
+        }
+    if status == publish_guard.STATUS_CANCELLED:
+        return False, {
+            "ok": False,
+            "message": f"Publish approval request {clean_id!r} was cancelled.",
+        }
+    if status == publish_guard.STATUS_EXPIRED or publish_guard.is_request_expired(record):
+        return False, {
+            "ok": False,
+            "message": f"Publish approval request {clean_id!r} has expired.",
+        }
+
+    if record["account_id"] != account_id:
+        return False, {
+            "ok": False,
+            "message": (
+                f"Publish approval request {clean_id!r} does not match account_id {account_id!r}."
+            ),
+        }
+    if record["container_id"] != container_id:
+        return False, {
+            "ok": False,
+            "message": (
+                f"Publish approval request {clean_id!r} does not match container_id "
+                f"{container_id!r}."
+            ),
+        }
+    if record["version_id"] != version_id:
+        return False, {
+            "ok": False,
+            "message": (
+                f"Publish approval request {clean_id!r} does not match version_id {version_id!r}."
+            ),
+        }
+    record_target = str(record["target"]) if "target" in record else publish_guard.TARGET_LIVE
+    if record_target != target:
+        return False, {
+            "ok": False,
+            "message": (
+                f"Publish approval request {clean_id!r} does not match target {target!r} "
+                f"(expected {record_target!r})."
+            ),
+        }
+
+    if status == publish_guard.STATUS_APPROVED:
+        if record.get("approved_via") == publish_guard.APPROVED_VIA_TERMINAL:
+            return False, None
+        return False, {
+            "ok": False,
+            "message": (
+                f"Publish approval request {clean_id!r} was not approved via the terminal; "
+                "create a new request with prepare_publish."
+            ),
+        }
+
+    if status != publish_guard.STATUS_PENDING:
+        return False, {
+            "ok": False,
+            "message": (
+                f"Publish approval request {clean_id!r} is not pending (status: {status!r})."
+            ),
+        }
+
+    if not _client_supports_elicitation(ctx):
+        return False, {
+            "ok": False,
+            "message": "this MCP client cannot show approval prompts; publishing is disabled",
+        }
+    assert ctx is not None
+
+    # ELICITATION 1 (typed container public ID)
+    typed_message = _format_elicit_typed_message(record)
+    try:
+        typed_result = await ctx.elicit(typed_message, _TypedPublishConfirmation)
+    except Exception:
+        _cancel_request_best_effort(clean_id, reason="approval prompt failed")
+        return True, {
+            "ok": False,
+            "message": (
+                f"Publish approval prompt failed for request {clean_id!r}; "
+                "request has been cancelled."
+            ),
+        }
+
+    typed_action = getattr(typed_result, "action", None)
+    typed_data = getattr(typed_result, "data", None)
+    if typed_action != "accept" or typed_data is None:
+        _cancel_request_best_effort(clean_id, reason=f"approval prompt {typed_action}")
+        return True, {
+            "ok": False,
+            "message": (
+                f"Publish approval was not accepted (action: {typed_action!r}); "
+                f"request {clean_id!r} has been cancelled."
+            ),
+        }
+
+    raw_typed = getattr(typed_data, "container_id", None)
+    if not isinstance(raw_typed, str) or not hmac.compare_digest(
+        raw_typed.strip(), record["public_id"]
+    ):
+        _cancel_request_best_effort(clean_id, reason="container public ID mismatch")
+        return True, {
+            "ok": False,
+            "message": (
+                f"Container public ID mismatch for request {clean_id!r}; "
+                "request has been cancelled."
+            ),
+        }
+
+    # ELICITATION 2 (click confirmation)
+    click_message = _format_elicit_click_message(record)
+    try:
+        click_result = await ctx.elicit(click_message, _ClickPublishConfirmation)
+    except Exception:
+        _cancel_request_best_effort(clean_id, reason="confirmation prompt failed")
+        return True, {
+            "ok": False,
+            "message": (
+                f"Final publish confirmation prompt failed for request {clean_id!r}; "
+                "request has been cancelled."
+            ),
+        }
+
+    click_action = getattr(click_result, "action", None)
+    click_data = getattr(click_result, "data", None)
+    if click_action != "accept" or click_data is None:
+        _cancel_request_best_effort(clean_id, reason=f"confirmation prompt {click_action}")
+        return True, {
+            "ok": False,
+            "message": (
+                f"Final publish confirmation was not accepted (action: {click_action!r}); "
+                f"request {clean_id!r} has been cancelled."
+            ),
+        }
+
+    clicked = getattr(click_data, "publish", None)
+    if clicked is not True:
+        _cancel_request_best_effort(clean_id, reason="confirmation not selected")
+        return True, {
+            "ok": False,
+            "message": (
+                f"Final publish confirmation was not selected for request {clean_id!r}; "
+                "request has been cancelled."
+            ),
+        }
+
+    try:
+        publish_guard.approve_via_elicitation(
+            clean_id,
+            typed_public_id=raw_typed,
+            clicked=clicked,
+        )
+    except publish_guard.PublishApprovalError as exc:
+        return True, {"ok": False, "message": str(exc)}
+
+    return True, None
 
 
 @tool("read")
@@ -975,14 +1352,15 @@ def undelete_version(account_id: str, container_id: str, version_id: str) -> dic
 
 
 @tool("publish")
-def set_latest_version(
+async def set_latest_version(
     account_id: str,
     container_id: str,
     version_id: str,
     approval_id: str = "",
     confirm: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Set a container version as latest after out-of-band terminal approval and confirm=true."""
+    """Set a container version as latest after two-step approval and confirm=true."""
     require("publish")
     if not confirm:
         return {
@@ -997,9 +1375,19 @@ def set_latest_version(
             "ok": False,
             "message": (
                 "Setting the latest version requires an approval_id from prepare_publish "
-                "(with latest=true), approved via `tag-manager-approve`."
+                "(with latest=true)."
             ),
         }
+    _, error = await _ensure_publish_approved(
+        approval_id,
+        account_id=account_id,
+        container_id=container_id,
+        version_id=version_id,
+        target=publish_guard.TARGET_LATEST,
+        ctx=ctx,
+    )
+    if error is not None:
+        return error
     header = _fetch_latest_version_header_optional(get_reader(), account_id, container_id)
     current_latest_version_id = str(header.get("containerVersionId") or "") if header else ""
     try:
@@ -1012,6 +1400,7 @@ def set_latest_version(
             current_live_version_id=current_latest_version_id,
         )
     except publish_guard.PublishApprovalError as exc:
+        _cancel_request_best_effort(approval_id.strip(), reason=str(exc))
         return {"ok": False, "message": str(exc)}
     result = get_writer().set_latest_version(account_id, container_id, version_id)
     return {"ok": True, "result": result}
@@ -1050,9 +1439,26 @@ def update_environment(
     error = _validate_environment_body(body)
     if error is not None:
         return error
+    if not isinstance(body, dict) or not body:
+        raise ValueError("body must be a non-empty JSON object")
+    writer = get_writer()
+    current = writer.get_environment(account_id, container_id, environment_id)
+    type_error = _require_user_environment(environment_id, current)
+    if type_error is not None:
+        return type_error
+    allowed_updates = {
+        field: body[field] for field in _ENV_MUTABLE_METADATA_FIELDS if field in body
+    }
+    update_body = _build_environment_update_body(current, allowed_updates)
+    current_fp = current.get("fingerprint")
+    effective_fingerprint = (
+        fingerprint
+        if fingerprint
+        else (current_fp if isinstance(current_fp, str) and current_fp else None)
+    )
     return _redact_environment(
-        get_writer().update_environment(
-            account_id, container_id, environment_id, body, fingerprint
+        writer.update_environment(
+            account_id, container_id, environment_id, update_body, effective_fingerprint
         )
     )
 
@@ -1065,7 +1471,12 @@ def delete_environment(
     require("write")
     if not confirm:
         return {"ok": False, "message": "Deleting an environment requires confirm=true."}
-    result = get_writer().delete_environment(account_id, container_id, environment_id)
+    writer = get_writer()
+    current = writer.get_environment(account_id, container_id, environment_id)
+    type_error = _require_user_environment(environment_id, current)
+    if type_error is not None:
+        return type_error
+    result = writer.delete_environment(account_id, container_id, environment_id)
     return {"ok": True, "result": result}
 
 
@@ -1322,6 +1733,9 @@ def prepare_publish(
             raise ValueError("environment_id must be a non-empty resource ID, not a path")
         target = f"{publish_guard.TARGET_ENVIRONMENT_PREFIX}{env_id}"
         env = get_writer().get_environment(account_id, container_id, env_id)
+        type_error = _require_user_environment(env_id, env)
+        if type_error is not None:
+            return type_error
         target_name = str(env["name"]) if env.get("name") else None
         live_version_id = str(env.get("containerVersionId") or "")
         baseline = (
@@ -1329,7 +1743,6 @@ def prepare_publish(
             if live_version_id
             else None
         )
-        next_tool = "publish_to_environment"
     elif latest:
         target = publish_guard.TARGET_LATEST
         header = _fetch_latest_version_header_optional(reader, account_id, container_id)
@@ -1339,12 +1752,10 @@ def prepare_publish(
             if live_version_id
             else None
         )
-        next_tool = "set_latest_version"
     else:
         target = publish_guard.TARGET_LIVE
         baseline = _fetch_live_version_optional(reader, account_id, container_id)
         live_version_id = str(baseline.get("containerVersionId") or "") if baseline else ""
-        next_tool = "publish_version"
 
     has_baseline = baseline is not None
     version_container = version.get("container") or {}
@@ -1390,8 +1801,9 @@ def prepare_publish(
         "summary": summary,
         "expires_at": record["expires_at"],
         "next_step": (
-            f"A human must run `tag-manager-approve {approval_id}` in a terminal "
-            f"and type the container ID. Then call {next_tool} with this approval_id."
+            "Call publish_version (or publish_to_environment / set_latest_version) with this "
+            "approval_id; your MCP client will ask you to type the container ID and then click "
+            "to confirm."
         ),
     }
     if target_name is not None:
@@ -1400,14 +1812,15 @@ def prepare_publish(
 
 
 @tool("publish")
-def publish_version(
+async def publish_version(
     account_id: str,
     container_id: str,
     version_id: str,
     approval_id: str = "",
     confirm: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Publish a container version live after out-of-band terminal approval and confirm=true."""
+    """Publish a container version live after two-step approval and confirm=true."""
     require("publish")
     if not confirm:
         return {
@@ -1417,11 +1830,18 @@ def publish_version(
     if not isinstance(approval_id, str) or not approval_id.strip():
         return {
             "ok": False,
-            "message": (
-                "Publishing requires an approval_id from prepare_publish, "
-                "approved via `tag-manager-approve`."
-            ),
+            "message": "Publishing requires an approval_id from prepare_publish.",
         }
+    _, error = await _ensure_publish_approved(
+        approval_id,
+        account_id=account_id,
+        container_id=container_id,
+        version_id=version_id,
+        target=publish_guard.TARGET_LIVE,
+        ctx=ctx,
+    )
+    if error is not None:
+        return error
     live = _fetch_live_version_optional(get_reader(), account_id, container_id)
     current_live_version_id = str(live.get("containerVersionId") or "") if live else ""
     try:
@@ -1434,21 +1854,23 @@ def publish_version(
             current_live_version_id=current_live_version_id,
         )
     except publish_guard.PublishApprovalError as exc:
+        _cancel_request_best_effort(approval_id.strip(), reason=str(exc))
         return {"ok": False, "message": str(exc)}
     result = get_client().publish_version(account_id, container_id, version_id)
     return {"ok": True, "result": result}
 
 
 @tool("publish")
-def publish_to_environment(
+async def publish_to_environment(
     account_id: str,
     container_id: str,
     environment_id: str,
     version_id: str,
     approval_id: str = "",
     confirm: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Point a user environment at a container version after terminal approval and confirm=true."""
+    """Point a user environment at a container version after two-step approval and confirm=true."""
     require("publish")
     if not confirm:
         return {
@@ -1460,7 +1882,7 @@ def publish_to_environment(
             "ok": False,
             "message": (
                 "Publishing to an environment requires an approval_id from prepare_publish "
-                "(with environment_id), approved via `tag-manager-approve`."
+                "(with environment_id)."
             ),
         }
     env_id = str(environment_id).strip()
@@ -1468,6 +1890,25 @@ def publish_to_environment(
         raise ValueError("environment_id must be a non-empty resource ID, not a path")
     writer = get_writer()
     env = writer.get_environment(account_id, container_id, env_id)
+    type_error = _require_user_environment(env_id, env)
+    if type_error is not None:
+        return type_error
+    ran_elicitation, error = await _ensure_publish_approved(
+        approval_id,
+        account_id=account_id,
+        container_id=container_id,
+        version_id=version_id,
+        target=f"{publish_guard.TARGET_ENVIRONMENT_PREFIX}{env_id}",
+        ctx=ctx,
+    )
+    if error is not None:
+        return error
+    if ran_elicitation:
+        env = writer.get_environment(account_id, container_id, env_id)
+        type_error = _require_user_environment(env_id, env)
+        if type_error is not None:
+            _cancel_request_best_effort(approval_id.strip(), reason=type_error["message"])
+            return type_error
     current_version_id = str(env.get("containerVersionId") or "")
     try:
         publish_guard.consume_approval(
@@ -1479,11 +1920,9 @@ def publish_to_environment(
             current_live_version_id=current_version_id,
         )
     except publish_guard.PublishApprovalError as exc:
+        _cancel_request_best_effort(approval_id.strip(), reason=str(exc))
         return {"ok": False, "message": str(exc)}
-    update_body: dict[str, Any] = {
-        field: env[field] for field in _ENV_MUTABLE_METADATA_FIELDS if field in env
-    }
-    update_body["containerVersionId"] = version_id
+    update_body = _build_environment_update_body(env, {"containerVersionId": version_id})
     fingerprint = env.get("fingerprint")
     result = writer.update_environment(
         account_id,
